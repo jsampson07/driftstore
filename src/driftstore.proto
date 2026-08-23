@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package driftstore;
+
+service DriftStoreNode {
+    rpc Ping(PingRequest) returns (PingResponse);
+}
+
+message PingRequest {
+    string sender_node_id = 1;
+}
+
+message PingResponse {
+    string responder_node_id = 1;
+}

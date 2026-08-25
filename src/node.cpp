@@ -65,11 +65,11 @@ public:
     // placement: the node must be reachable as a server before it starts acting
     // as an autonomous client. Spawns the loop and detaches it.
     //
-    // Teardown note (see ARCHITECTURE.md): detached + no stop signal is only
-    // correct as long as this process's only exit path is SIGKILL. If that
-    // assumption ever changes, this needs a stop mechanism before it's safe. Otherwise
-    // if instance containing start() is destroyed while exec'ing gossipLoop(), then
-    // we get undefined behavior. Must have entire process killed immediately (SIGKILL).
+    // Teardown note: detached + no stop signal is only correct as long as this
+    // process's only exit path is SIGKILL. If that assumption ever changes, this needs 
+    // a stop mechanism before it's safe. Otherwise if instance containing start()
+    // is destroyed while exec'ing gossipLoop(), then we get undefined behavior.
+    // Must have entire process killed immediately (SIGKILL).
     void start(int64_t gossip_interval_ms) {
         std::thread([this, gossip_interval_ms]() {
             gossipLoop(gossip_interval_ms);
@@ -82,7 +82,8 @@ public:
         logEvent(EventType::GOSSIP_RECEIVED, node_id_,
                  "sender=" + request->sender_node_id());
         driftstore::MembershipTable merged = applyGossip(request->table());
-        logEvent(EventType::GOSSIP_MERGED, node_id_, "sender=" + request->sender_node_id());
+        logEvent(EventType::GOSSIP_MERGED, node_id_,
+            "sender=" + request->sender_node_id());
         response->set_responder_node_id(node_id_);
         *response->mutable_table() = merged;
         return grpc::Status::OK;
@@ -137,7 +138,9 @@ public:
             snapshot = table_;
         }
         driftstore::GossipResponse response = SendGossip(seed_addr, snapshot); // Retrieve merged table 'created' by receiving seed (should only have the additional entry for this new bootstrapping node)
-        applyGossip(response.table()); // This new node will now update its membership table to what merged table returned by seed
+        driftstore::MembershipTable merged = applyGossip(response.table()); // This new node will now update its membership table to what merged table returned by seed
+        logEvent(EventType::GOSSIP_MERGED, node_id_,
+            "source=bootstrap seed=" + seed_addr);
     }
 
 private:
@@ -152,23 +155,6 @@ private:
         }
     }
 
-    //   1. Snapshot table_ under table_mutex_, then release the lock before
-    //      doing anything else — mirror bootstrapFromSeed's
-    //      snapshot-then-unlock shape. The RPC itself must happen outside
-    //      table_mutex_, same reasoning as bootstrapFromSeed: don't stall the
-    //      inbound GossipExchange handler for the duration of a network round
-    //      trip.
-    //   2. Select a gossip target from UP-only entries in that snapshot
-    //      (selectGossipTarget below).
-    //   3. Empty-candidate-list case: log GOSSIP_NO_PEERS and return. Do NOT
-    //      retry, backoff, or escalate here — that behavior is scoped to
-    //      bootstrapFromSeed only (see ARCHITECTURE.md's empty-candidate-list
-    //      split). A steady-state tick just waits for the next interval.
-    //   4. SendGossip(target_address, snapshot) — this is the push half only.
-    //   5. Complete the pull: applyGossip(response.table()) on what comes
-    //      back. Easy to forget — SendGossip does not do this for you by
-    //      design (see PROGRESS.md's SendGossip/applyGossip note). Skipping
-    //      this step silently degrades the round from push-pull to push-only.
     /**
     * 1. Snapshot local table
     * 2. Select candidate peer
@@ -190,7 +176,9 @@ private:
             return;
         }
         driftstore::GossipResponse response = SendGossip(*peerAddr, snapshot);
-        applyGossip(response.table());
+        driftstore::MembershipTable merged = applyGossip(response.table());
+        logEvent(EventType::GOSSIP_MERGED, node_id_,
+            "source=round peer=" + *peerAddr);
     }
 
     /**
@@ -253,7 +241,7 @@ int main(int argc, char** argv) {
     }
 
     service.start(std::stoll(gossip_interval_ms));
-    
+
     server->Wait();
     return 0;
 }

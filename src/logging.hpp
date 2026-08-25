@@ -10,6 +10,12 @@ enum class EventType {
     PING_SUCCEEDED,
     PING_FAILED,
     NODE_INIT,
+    GOSSIP_SENT,
+    GOSSIP_RECEIVED,
+    GOSSIP_SUCCEEDED,
+    GOSSIP_FAILED, // this should mean that the gossip was attempted and it failed (e.g. peer was unreachable, connection refused, process dies midway)
+    GOSSIP_NO_PEERS, // this should be distinct from GOSSIP_FAILED where failure case is no peers to even contact
+    GOSSIP_MERGED,
 };
 
 inline const char* toString(EventType e) {
@@ -19,6 +25,12 @@ inline const char* toString(EventType e) {
         case EventType::PING_SUCCEEDED: return "PING_SUCCEEDED";
         case EventType::PING_FAILED: return "PING_FAILED";
         case EventType::NODE_INIT: return "NODE_INIT";
+        case EventType::GOSSIP_SENT: return "GOSSIP_SENT";
+        case EventType::GOSSIP_RECEIVED: return "GOSSIP_RECEIVED";
+        case EventType::GOSSIP_SUCCEEDED: return "GOSSIP_SUCCEEDED";
+        case EventType::GOSSIP_FAILED: return "GOSSIP_FAILED";
+        case EventType::GOSSIP_MERGED: return "GOSSIP_MERGED";
+        case EventType::GOSSIP_NO_PEERS: return "GOSSIP_NO_PEERS";
     }
 }
 
@@ -44,4 +56,3 @@ inline void logEvent(EventType event, const std::string& node_id, const std::str
         extra_kv.empty() ? "" : " ", // if message is empty then add nothing, otherwise add a space
         extra_kv.c_str()); // add the key:value
 }
-

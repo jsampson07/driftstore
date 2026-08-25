@@ -2,8 +2,26 @@ syntax = "proto3";
 
 package driftstore;
 
+enum NodeStatus {
+    UP = 0;
+    REMOVED = 1;
+}
+
+message MembershipEntry {
+    string writer_id = 1;
+    string address = 2;
+    NodeStatus status = 3;
+    repeated uint64 tokens = 4;
+    int64 last_updated = 5;
+}
+
+message MembershipTable {
+    map<string, MembershipEntry> entries = 1;
+}
+
 service DriftStoreNode {
     rpc Ping(PingRequest) returns (PingResponse);
+    rpc GossipExchange(GossipRequest) returns (GossipResponse);
 }
 
 message PingRequest {
@@ -12,4 +30,14 @@ message PingRequest {
 
 message PingResponse {
     string responder_node_id = 1;
+}
+
+message GossipRequest {
+    string sender_node_id = 1;
+    MembershipTable table = 2; // push
+}
+
+message GossipResponse {
+    string responder_node_id = 1;
+    MembershipTable table = 2; // pull (in the same RT)
 }

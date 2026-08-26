@@ -11,6 +11,7 @@
 #include <thread>
 #include <vector>
 #include <iostream>
+#include <sstream>
 
 namespace {
 
@@ -44,6 +45,12 @@ namespace {
     
 }  // namespace
 
+
+/**
+PUBLIC METHODS
+*/
+
+
 void mergeInto(driftstore::MembershipTable& local, const driftstore::MembershipTable& incoming) {
     auto* local_entries = local.mutable_entries();
     for (const auto& [node_id, incoming_entry] : incoming.entries()) {
@@ -62,6 +69,19 @@ void mergeInto(driftstore::MembershipTable& local, const driftstore::MembershipT
         }
     }
 }
+
+std::vector<std::string> splitSeeds(const std::string& raw) {
+    std::vector<std::string> result;
+    std::stringstream ss(raw);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+        if (!token.empty()) {
+            result.push_back(token);
+        }
+    }
+    return result;
+}
+
 
 class NodeServiceImpl final : public driftstore::DriftStoreNode::Service {
 public:
@@ -131,7 +151,7 @@ public:
      * @param table The table to send to the node to merge
      * @return The response from the peer (response_node_id + merged table)
      */
-    driftstore::GossipResponse SendGossip(const std::string& peer_address,
+    std::optional<driftstore::GossipResponse> SendGossip(const std::string& peer_address,
                                           const driftstore::MembershipTable& table) {
         auto channel = grpc::CreateChannel(peer_address, grpc::InsecureChannelCredentials());
         std::unique_ptr<driftstore::DriftStoreNode::Stub> stub =
@@ -149,11 +169,12 @@ public:
         if (status.ok()) {
             logEvent(EventType::GOSSIP_SUCCEEDED, node_id_,
                      "responder=" + response.responder_node_id());
+            return response;
         } else {
             logEvent(EventType::GOSSIP_FAILED, node_id_,
                      "target=" + peer_address + " error=" + status.error_message());
+            return std::nullopt;
         }
-        return response;
     }
 
     /**
@@ -166,16 +187,32 @@ public:
         return table_;
     }
     
-    void bootstrapFromSeed(const std::string& seed_addr) {
-        driftstore::MembershipTable snapshot;
-        {
-            std::lock_guard<std::mutex> lock(table_mutex_);
-            snapshot = table_;
+    bool bootstrapFromSeed(const std::vector<std::string>& seeds) {
+        int64_t backoff_ms = 250;
+        for (int pass = 0; pass < 3; pass++) {
+            for (std::string seed : seeds) {
+                // Snapshot for each seed (almost negligable work b/c most of the time it will be empty)
+                driftstore::MembershipTable snapshot;
+                {
+                    std::lock_guard<std::mutex> lock(table_mutex_);
+                    snapshot = table_;
+                }
+                std::optional<driftstore::GossipResponse> response = SendGossip(seed, snapshot);
+                if (response) {
+                    driftstore::MembershipTable merged = applyGossip(response->table()); // This new node will now update its membership table to what merged table returned by seed
+                    logEvent(EventType::GOSSIP_MERGED, node_id_,
+                        "source=bootstrap seed=" + seed);
+                    logEvent(EventType::BOOTSTRAP_SUCCEEDED, node_id_);
+                    return true;
+                }
+            }
+            if (pass < 2) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms)); // Sleep for default = 1, or provided
+                backoff_ms *= 2;
+            }
         }
-        driftstore::GossipResponse response = SendGossip(seed_addr, snapshot); // Retrieve merged table 'created' by receiving seed (should only have the additional entry for this new bootstrapping node)
-        driftstore::MembershipTable merged = applyGossip(response.table()); // This new node will now update its membership table to what merged table returned by seed
-        logEvent(EventType::GOSSIP_MERGED, node_id_,
-            "source=bootstrap seed=" + seed_addr);
+        logEvent(EventType::BOOTSTRAP_FAILED, node_id_, "passes=3 seeds=" + std::to_string(seeds.size()));
+        return false;
     }
 
 private:
@@ -210,10 +247,12 @@ private:
             logEvent(EventType::GOSSIP_NO_PEERS, node_id_);
             return;
         }
-        driftstore::GossipResponse response = SendGossip(*peerAddr, snapshot);
-        driftstore::MembershipTable merged = applyGossip(response.table());
-        logEvent(EventType::GOSSIP_MERGED, node_id_,
-            "source=round peer=" + *peerAddr);
+        std::optional<driftstore::GossipResponse> response = SendGossip(*peerAddr, snapshot);
+        if (response) {
+            driftstore::MembershipTable merged = applyGossip(response->table()); // This new node will now update its membership table to what merged table returned by seed
+            logEvent(EventType::GOSSIP_MERGED, node_id_,
+                "source=round peer=" + *peerAddr);
+        }
     }
 
     /**
@@ -242,8 +281,8 @@ private:
 
 int main(int argc, char** argv) {
     std::string listen;
-    std::string seed;
-    std::string gossip_interval_ms = "1000";  // ms, matches the 1s default
+    std::string seed_arg;  // possibly comma-separated
+    std::string gossip_interval_ms = "1000";
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         static constexpr char kListenPrefix[] = "--listen=";
@@ -252,13 +291,15 @@ int main(int argc, char** argv) {
         if (arg.rfind(kListenPrefix, 0) == 0) {
             listen = arg.substr(sizeof(kListenPrefix) - 1);
         } else if (arg.rfind(kSeedPrefix, 0) == 0) {
-            seed = arg.substr(sizeof(kSeedPrefix) - 1);
+            seed_arg = arg.substr(sizeof(kSeedPrefix) - 1);
         } else if (arg.rfind(kGossipIntervalPrefix, 0) == 0) {
             gossip_interval_ms = arg.substr(sizeof(kGossipIntervalPrefix) - 1);
         }
     }
     if (listen.empty()) {
-        std::fprintf(stderr, "usage: %s --listen=<address> [--seed=<address>]  [--gossip-interval=<time_in_ms>]\n", argv[0]);
+        std::fprintf(stderr,
+            "usage: %s --listen=<address> [--seed=<address>[,<address>...]] [--gossip-interval=<time_in_ms>]\n",
+            argv[0]);
         return 1;
     }
 
@@ -271,8 +312,17 @@ int main(int argc, char** argv) {
     builder.RegisterService(&service);
     std::unique_ptr<grpc::Server> server = builder.BuildAndStart();
 
-    if (!seed.empty()) {
-        service.bootstrapFromSeed(seed);
+    std::vector<std::string> seeds = splitSeeds(seed_arg);
+
+    if (!seeds.empty()) {
+        logEvent(EventType::BOOTSTRAP_INIT, node_id,
+            "source=bootstrap seeds=" + seed_arg);
+        if (!service.bootstrapFromSeed(seeds)) {
+            // Do not call service.start().
+            // server->Shutdown() before this return is the open question
+            // from earlier. Explicitly deferred for now.
+            return 1;
+        }
     }
 
     service.start(std::stoll(gossip_interval_ms));

@@ -23,6 +23,7 @@ service DriftStoreNode {
     rpc Ping(PingRequest) returns (PingResponse);
     rpc GossipExchange(GossipRequest) returns (GossipResponse);
     rpc GetStatus(StatusRequest) returns (StatusResponse);
+    rpc RemoveNode(RemoveRequest) returns (RemoveResponse);
 }
 
 message PingRequest {
@@ -48,4 +49,12 @@ message StatusRequest {}
 message StatusResponse {
     string node_id = 1;
     string table_dump = 2;
+}
+
+message RemoveRequest {
+    string removed_node_id = 1;
+}
+
+message RemoveResponse {
+    bool accepted = 1; // false if target_node_id is NOT in the table
 }

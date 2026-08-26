@@ -19,6 +19,10 @@ enum class EventType {
     BOOTSTRAP_INIT,
     BOOTSTRAP_SUCCEEDED,
     BOOTSTRAP_FAILED,
+    REMOVE_INIT,
+    REMOVE_FAILED,
+    REMOVE_SUCCEEDED,
+    NODE_REBOOTED,
 };
 
 inline const char* toString(EventType e) {
@@ -37,6 +41,10 @@ inline const char* toString(EventType e) {
         case EventType::BOOTSTRAP_INIT: return "BOOTSTRAP_INIT";
         case EventType::BOOTSTRAP_SUCCEEDED: return "BOOTSTRAP_SUCCEEDED";
         case EventType::BOOTSTRAP_FAILED: return "BOOTSTRAP_FAILED";
+        case EventType::REMOVE_INIT: return "REMOVE_INIT";
+        case EventType::REMOVE_FAILED: return "REMOVE_FAILED";
+        case EventType::REMOVE_SUCCEEDED: return "REMOVE_SUCCEEDED";
+        case EventType::NODE_REBOOTED: return "NODE_REBOOTED";
     }
 }
 

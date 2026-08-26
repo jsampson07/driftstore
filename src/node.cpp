@@ -51,7 +51,7 @@ PUBLIC METHODS
 */
 
 
-void mergeInto(driftstore::MembershipTable& local, const driftstore::MembershipTable& incoming) {
+void mergeInto(driftstore::MembershipTable& local, const driftstore::MembershipTable& incoming, const std::string& caller_node_id) {
     auto* local_entries = local.mutable_entries();
     for (const auto& [node_id, incoming_entry] : incoming.entries()) {
         auto it = local_entries->find(node_id);
@@ -61,9 +61,17 @@ void mergeInto(driftstore::MembershipTable& local, const driftstore::MembershipT
         }
         const auto& local_entry = it->second;
         if (incoming_entry.last_updated() > local_entry.last_updated()) {
+            if (local_entry.status() == driftstore::REMOVED && incoming_entry.status() == driftstore::UP) {
+                logEvent(EventType::NODE_REBOOTED, caller_node_id, "node_id=" + node_id + " status=" + toString(driftstore::UP) + 
+                        " writer_id=" + incoming_entry.writer_id() + " last_updated=" + std::to_string(incoming_entry.last_updated()));
+            }
             (*local_entries)[node_id] = incoming_entry;
         } else if (incoming_entry.last_updated() == local_entry.last_updated()) {
             if (incoming_entry.writer_id() > local_entry.writer_id()) {
+                if (local_entry.status() == driftstore::REMOVED && incoming_entry.status() == driftstore::UP) {
+                    logEvent(EventType::NODE_REBOOTED, caller_node_id, "node_id=" + node_id + " status=" + toString(driftstore::UP) + 
+                            " writer_id=" + incoming_entry.writer_id() + " last_updated=" + std::to_string(incoming_entry.last_updated()));
+                }
                 (*local_entries)[node_id] = incoming_entry;
             }
         }
@@ -115,6 +123,33 @@ public:
         response->set_table_dump(dumpTable(snapshot));
         return grpc::Status::OK;
     }
+
+    grpc::Status RemoveNode(grpc::ServerContext* /* context */,
+                         const driftstore::RemoveRequest* request,
+                         driftstore::RemoveResponse* response) override {
+    std::lock_guard<std::mutex> lock(table_mutex_);
+    auto* entries = table_.mutable_entries();
+    auto it = entries->find(request->removed_node_id());
+    if (it == entries->end()) {
+        response->set_accepted(false);
+    } else {
+        if (it->second.status() == driftstore::REMOVED) {
+            // No-op
+        } else {
+            it->second.set_status(driftstore::REMOVED);
+            it->second.set_writer_id(node_id_);
+            it->second.clear_tokens();
+            it->second.set_last_updated(nowMillis());
+        }
+        response->set_accepted(true);
+        logEvent(EventType::REMOVE_SUCCEEDED, node_id_,
+            "node_id=" + request->removed_node_id() +
+            " status=" + toString(driftstore::REMOVED) +
+            " writer_id=" + node_id_ +
+            " last_updated=" + std::to_string(it->second.last_updated()));
+    }
+    return grpc::Status::OK;
+}
 
     // Call once from main(), after BuildAndStart() — mirrors bootstrapFromSeed's
     // placement: the node must be reachable as a server before it starts acting
@@ -183,7 +218,7 @@ public:
     */
     driftstore::MembershipTable applyGossip(const driftstore::MembershipTable& incoming) {
         std::lock_guard<std::mutex> lock(table_mutex_);
-        mergeInto(table_, incoming);
+        mergeInto(table_, incoming, node_id_);
         return table_;
     }
     

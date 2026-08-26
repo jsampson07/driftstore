@@ -16,6 +16,9 @@ enum class EventType {
     GOSSIP_FAILED, // this should mean that the gossip was attempted and it failed (e.g. peer was unreachable, connection refused, process dies midway)
     GOSSIP_NO_PEERS, // this should be distinct from GOSSIP_FAILED where failure case is no peers to even contact
     GOSSIP_MERGED,
+    BOOTSTRAP_INIT,
+    BOOTSTRAP_SUCCEEDED,
+    BOOTSTRAP_FAILED,
 };
 
 inline const char* toString(EventType e) {
@@ -31,6 +34,9 @@ inline const char* toString(EventType e) {
         case EventType::GOSSIP_FAILED: return "GOSSIP_FAILED";
         case EventType::GOSSIP_MERGED: return "GOSSIP_MERGED";
         case EventType::GOSSIP_NO_PEERS: return "GOSSIP_NO_PEERS";
+        case EventType::BOOTSTRAP_INIT: return "BOOTSTRAP_INIT";
+        case EventType::BOOTSTRAP_SUCCEEDED: return "BOOTSTRAP_SUCCEEDED";
+        case EventType::BOOTSTRAP_FAILED: return "BOOTSTRAP_FAILED";
     }
 }
 

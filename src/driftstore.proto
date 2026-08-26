@@ -22,6 +22,7 @@ message MembershipTable {
 service DriftStoreNode {
     rpc Ping(PingRequest) returns (PingResponse);
     rpc GossipExchange(GossipRequest) returns (GossipResponse);
+    rpc GetStatus(StatusRequest) returns (StatusResponse);
 }
 
 message PingRequest {
@@ -40,4 +41,11 @@ message GossipRequest {
 message GossipResponse {
     string responder_node_id = 1;
     MembershipTable table = 2; // pull (in the same RT)
+}
+
+message StatusRequest {}
+
+message StatusResponse {
+    string node_id = 1;
+    string table_dump = 2;
 }

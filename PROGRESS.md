@@ -91,9 +91,11 @@ ticks log `GOSSIP_NO_PEERS` and skip the round — retry/backoff stays scoped to
 ### Implemented in `node.cpp`
 
 **Proto (`src/driftstore.proto`):** `NodeStatus` (`UP` / `REMOVED`),
-`MembershipEntry` / `MembershipTable`, and `GossipExchange(GossipRequest) returns
+`MembershipEntry` / `MembershipTable`, `GossipExchange(GossipRequest) returns
 (GossipResponse)` — request and response both carry a `MembershipTable` (push
-and pull in the same round trip).
+and pull in the same round trip) — and `GetStatus(StatusRequest) returns
+(StatusResponse)` (empty request; response carries `node_id` + a text table
+dump — see "Status/debug endpoint" below).
 
 **Own entry + merge:** the constructor seeds `table_` with this node's own
 `MembershipEntry` (`writer_id` and `address` both set to `node_id_`, status
@@ -117,7 +119,8 @@ table onto the response.
 lock, `SendGossip` to the seed, then `applyGossip(response.table())`. Same
 snapshot-then-unlock shape the periodic round uses — the RPC must not be held
 under `table_mutex_`, or an inbound `GossipExchange` would stall for a
-network round trip.
+network round trip. Now also logs `GOSSIP_MERGED` after completing its merge
+(see "GOSSIP_MERGED coverage" below — this call site used to be silent).
 
 **`start()` / `gossipLoop()`:** `start(gossip_interval_ms)` spawns a detached
 thread that loops `gossipRound()` + sleep. Detached + no stop signal is only
@@ -125,8 +128,38 @@ correct while this process's only exit path is SIGKILL (see `ARCHITECTURE.md`).
 `main()` already had optional `--seed`; `bootstrapFromSeed` runs after
 `BuildAndStart()` so the node is reachable as a server before it dials out.
 
+**`GetStatus` / `dumpTable` — status/debug endpoint:** `dumpTable()` is a
+free function (anonymous namespace, alongside `nowMillis()`) that snapshots a
+`MembershipTable`, sorts entries by `node_id`, and renders
+`table_size=<n> entries=[node_id:status:writer_id:last_updated, ...]` as a
+single string — sorted specifically so output is diffable by eye across
+different nodes' status calls. `GetStatus` snapshots `table_` under
+`table_mutex_`, calls `dumpTable`, and returns it in `StatusResponse`. Purely
+a human debugging tool for now — deliberately not shaped as a machine-facing
+endpoint (no plan yet to have the fault-injection or comparison harness call
+it programmatically; revisit if that changes).
+
+**`client.cpp` `--status` mode:** new flag, mutually exclusive with `--self`
+(a status query has no `sender_node_id` to populate). Prints
+`node=<id> <table_dump>` to stdout on success. Uses a 2s RPC deadline —
+doesn't retroactively fix Q10's concern about `Ping`'s missing deadline, but
+doesn't repeat that gap in new code.
+
 **Logging:** `EventType` gained `GOSSIP_SENT`, `GOSSIP_RECEIVED`,
 `GOSSIP_SUCCEEDED`, `GOSSIP_FAILED`, `GOSSIP_NO_PEERS`, `GOSSIP_MERGED`.
+`GetStatus` intentionally has no dedicated `EventType` — it's a pull-based
+debug query, not part of the gossip protocol itself, so logging it would add
+noise to logs meant to trace real membership propagation.
+
+**`GOSSIP_MERGED` coverage — now logged at all three merge-completion
+points.** Previously only the inbound `GossipExchange` handler logged
+`GOSSIP_MERGED` — `gossipRound()`'s pull-half merge and
+`bootstrapFromSeed()`'s merge were silent, discovered while adding temporary
+table-dump instrumentation for multi-node convergence testing (see
+"Verification" below). Kept the log calls at both previously-silent sites
+permanently, with a short `source=round peer=<addr>` /
+`source=bootstrap seed=<addr>` payload — not the full table dump, which was
+temporary and has been removed.
 
 ### Periodic gossip scheduler — implemented
 
@@ -145,8 +178,8 @@ with `std::stoll`, no exception handling on malformed input yet — see
 seedless node still needs to run its own scheduler so it's ready to gossip
 once another node joins it later.
 
-Public/private boundary confirmed: only `start()`, `Ping`, `GossipExchange`,
-`SendGossip`, `applyGossip`, and `bootstrapFromSeed` are public;
+Public/private boundary confirmed: `start()`, `Ping`, `GossipExchange`,
+`GetStatus`, `SendGossip`, `applyGossip`, and `bootstrapFromSeed` are public;
 `gossipLoop`, `gossipRound`, and `selectGossipTarget` are private.
 
 ### Bugs caught during implementation
@@ -177,43 +210,92 @@ Public/private boundary confirmed: only `start()`, `Ping`, `GossipExchange`,
   produced "Illegal instruction (core dumped)" at runtime. Diagnosed with
   `gdb --args ./bin/node --listen=...`, `run`, `bt` — the backtrace pointed
   directly at `toString` ← `logEvent` ← `gossipRound` ← `gossipLoop`. Fixed
-  by adding the missing case. Open follow-up, not yet confirmed: whether
-  `-Wswitch` (part of `-Wall`, and the mechanism `logging.hpp`'s own comment
-  says exists specifically to catch a missing case like this at compile time)
-  is actually enabled as a hard error in the Makefile's `CXXFLAGS` — see
-  `OPEN_QUESTIONS.md`.
+  by adding the missing case.
 
-### Not yet verified
+  Follow-up checked and resolved: `-Wswitch` **is** enabled (it's part of
+  `-Wall`, which the Makefile already sets), so a future missing `case`
+  *will* produce a compiler warning. However, the Makefile has no `-Werror`,
+  so that warning would not fail the build — a future missing case would
+  still compile successfully and crash at runtime exactly like this one did.
+  Decision: not being fixed right now (deprioritized, see
+  `OPEN_QUESTIONS.md` if this gets revisited).
 
-Temporary `std::cout` debug statements (`"Gossip"`, `"AFTER GOSSIP LOOP WAITING FOR REQUESTS"`)
-were added to `node.cpp` during this troubleshooting session and need to be
-confirmed removed before this is considered clean — they were never part of
-the project's stderr-based structured logging format.
+### Verification
+
+**Debug `std::cout` statements — confirmed removed.** The temporary
+`std::cout` debug lines (`"Gossip"`, `"AFTER GOSSIP LOOP WAITING FOR
+REQUESTS"`) added during the `GOSSIP_NO_PEERS` crash investigation are
+confirmed absent from `node.cpp`. No longer an open item.
+
+**Multi-node convergence — verified.** Ran 3 live processes (one seed, two
+joining via `--seed`), stderr captured via `tee` to per-node log files.
+Confirmed `GOSSIP_SENT` → `GOSSIP_RECEIVED` → `GOSSIP_MERGED` correlate
+across independent processes' logs — not just inferred from single-node
+behavior.
+
+Went one step further than log correlation alone: temporarily instrumented
+`GOSSIP_MERGED` with a full table-content dump (table size + sorted
+per-entry `node_id:status:writer_id:timestamp`) to confirm actual table
+*convergence*, not just clean RPC exchanges — the two are different claims,
+and correlated SENT/RECEIVED/MERGED logs alone can't distinguish "converged"
+from "kept merging and staying different." All three nodes settled on
+matching table contents. The temporary dump payload has since been removed;
+only the (trimmed) `GOSSIP_MERGED` log calls at the two previously-silent
+sites were kept permanently (see "GOSSIP_MERGED coverage" above). This same
+`dumpTable()` logic is now what backs the permanent `GetStatus` RPC.
+
+**Debugging note — stale/stopped processes masked real behavior as a
+network failure.** The first attempt at this multi-node run appeared broken
+(every gossip attempt timing out after ~20s, `GOSSIP_RECEIVED` never firing
+on the seed). Root cause was **not** a code bug: `ss -ltnp` + `ps aux` found
+`node` processes left in a *stopped* state (`Tl`/`tl`) from earlier
+`gdb --args ./bin/node --listen=...` sessions that were never cleanly
+killed. A stopped process still holds its listen socket at the kernel
+level even though it can't `accept()` or complete a handshake, so a later,
+legitimate `node` process targeting the same address silently lost the
+bind — `AddListeningPort`'s success/failure out-param is currently
+unchecked, so this failure was indistinguishable from healthy startup in
+that node's own logs. Fixed with `kill -9` (not plain `kill` — a stopped
+process doesn't act on `SIGTERM`) on both the stopped `node` processes and
+their `gdb` parents. See `OPEN_QUESTIONS.md` Q11.
 
 ### Not yet built for Phase 1
 
-The scheduler itself is now implemented but **not yet verified** against real
-multi-node convergence — no run with 2+ live node processes watching
-`GOSSIP_SENT` / `GOSSIP_RECEIVED` / `GOSSIP_SUCCEEDED` / `GOSSIP_MERGED`
-correlate across processes has happened yet as of this update.
+Multi-node convergence and the status/debug endpoint are both done (see
+"Verification" and "Implemented in `node.cpp`" above). Remaining for
+Phase 1:
 
-**Explicit next step:** that multi-node correlated-log run, before:
-
-- the admin join/remove RPC
 - the full `bootstrapFromSeed` retry/backoff/ordered-fallback upgrade
-- the status/debug endpoint
+  (250ms start, exponential backoff, cap, 3-pass seed-list retry, then kill
+  with indication — per `ARCHITECTURE.md`)
+- the admin join/remove RPC
 
-All three still unstarted.
+**Explicit next step:** retry/backoff for `bootstrapFromSeed`, before admin
+join/remove — `ARCHITECTURE.md`'s draft answer has admin `join` reusing the
+same seed-targeting/retry mechanism, so building and proving it out against
+its one clear caller (bootstrap) first, then wiring a second caller onto it,
+is lower-risk than designing both at once. (Q5 — whether `remove`
+specifically also needs seed-targeting — is still unresolved and separate
+from this reasoning.)
 
 ### Debugging notes
 
-This session's crash was the project's first real use of gdb rather than
-correlated logs, and it was the right call specifically because the failure
-was single-process (one node, one crash, one stack) rather than the
-multi-process divergence the correlated-logging approach is built for —
-gdb's `bt` answered "where did control stop and what's the call chain" in
-one command, which log correlation across independent processes isn't suited
-to answer for a single crashed process.
+The `GOSSIP_NO_PEERS` crash (see "Bugs caught during implementation") was
+the project's first real use of gdb rather than correlated logs, and it was
+the right call specifically because the failure was single-process (one
+node, one crash, one stack) rather than the multi-process divergence the
+correlated-logging approach is built for — gdb's `bt` answered "where did
+control stop and what's the call chain" in one command, which log
+correlation across independent processes isn't suited to answer for a
+single crashed process.
+
+The stale-process issue during the convergence run (see "Verification"
+above) was the opposite case: no crash, no single stack to inspect — the
+failure only made sense once `ss`/`ps` output was cross-referenced against
+three independent nodes' logs, confirming that correlated system-level
+inspection (not gdb) is the right tool once the question is "why can't
+these processes talk to each other" rather than "why did this one process
+die."
 
 ---
 

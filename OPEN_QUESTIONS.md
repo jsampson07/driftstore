@@ -16,7 +16,10 @@ switch to an honest fixed string like `"test-client"` to stop pretending it's
 something it isn't.
 
 *Status:* unresolved, not blocking — `client.cpp` is throwaway Phase 0
-scaffolding either way.
+scaffolding either way. Now also used for `--status` queries, which have no
+`--self` at all — doesn't change the resolution of this question, but worth
+noting `client.cpp` now has two somewhat different identities depending on
+mode (a fabricated node identity for Ping, no identity at all for status).
 
 ### Q3 — Does GTStore's `storage` / `test_app` need an explicit manager address?
 `harness/smoke_test.sh` assumes `storage --port $PORT` and `test_app` locate
@@ -76,6 +79,10 @@ incidental no-op.
 *Status:* unresolved, not blocking — current behavior is correct as far as
 tested, but the correctness rests on an assumption the code doesn't
 enforce. Raised while tracing the gossip round end-to-end from memory.
+Directly relevant to the upcoming `bootstrapFromSeed` retry/backoff design —
+retry logic needs to distinguish "RPC failed, retry" from "RPC succeeded,"
+so this may get forced into resolution as part of that work rather than
+resolved standalone.
 
 ### Q9 — No error handling on `--gossip-interval`'s parse in `main()`
 `std::stoll(gossip_interval_ms)` throws on malformed input (e.g.
@@ -107,7 +114,10 @@ rather than fixed them.
 
 *Status:* unresolved — worth confirming whether `smoke_test.sh` currently
 completes end-to-end before trusting it as a regression check again, and
-worth checking whether `client.cpp` sets any RPC deadline at all.
+worth checking whether `client.cpp` sets any RPC deadline at all. Notably,
+`client.cpp`'s new `--status` path *does* now set a 2s deadline — `Ping`
+still doesn't, so the asymmetry is now visible directly in the source, not
+just suspected.
 
 ### Q5 — Does admin `remove` need to target a designated seed, same as bootstrap?
 The ordered-fallback-with-backoff seed mechanism (250ms timeout, exponential
@@ -123,7 +133,9 @@ for remove too. Raised during Phase 1 proto/schema work.
 
 *Status:* unresolved, not blocking — doesn't affect the `GossipExchange`
 proto/schema work already landed. Matters once the admin join/remove RPC
-gets designed. Flagged as taste/consistency, not correctness.
+gets designed. Flagged as taste/consistency, not correctness. Will need
+answering as part of the now-next-up admin join/remove design, after
+retry/backoff lands.
 
 ---
 
@@ -159,3 +171,50 @@ design, are expected to no longer be running) for no information gain.
 
 *Context:* raised while designing the round scheduler's peer selection.
 *Full reasoning:* this chat's Phase 1 implementation thread.
+
+### Q11 — Stale/stopped processes from abandoned gdb sessions can hold a
+listen socket indefinitely, masking real behavior as a network failure
+Multiple `node --listen=127.0.0.1:60051` processes launched under `gdb`
+across earlier debugging sessions, never cleanly killed, were left in a
+*stopped* state (`Tl`/`tl` in `ps aux`) — the kernel still held their
+`LISTEN` socket (visible in `ss -ltnp`) even though the process couldn't
+`accept()` a connection or complete a gRPC/HTTP-2 handshake. A subsequent
+legitimate `node` process targeting the same address silently lost the
+bind (`AddListeningPort`'s success/failure out-param is unchecked), and
+every peer's gossip attempt against that address then failed after a ~20s
+connect timeout — indistinguishable, from the logs alone, from a genuine
+network/reachability failure.
+
+**Resolution:** `kill -9` (not plain `kill`/`SIGTERM` — a stopped process
+doesn't act on `SIGTERM`) on both the stopped `node` processes and their
+`gdb` parents. Adopted as standing practice: `pkill -9 -f bin/node` before
+any multi-node test run, and prefer `gdb`'s own `kill`/`quit`-with-confirm
+over backgrounding a debug session and moving on.
+
+*Context:* surfaced during the first multi-node convergence verification
+run for Phase 1.
+*Relevant follow-up, not yet fixed:* `AddListeningPort`'s return value is
+still unchecked in `node.cpp`, so a real bind failure still can't be told
+apart from healthy startup in that node's own logs. Worth fixing before
+Phase 8's kill/restart fault injection, where this exact ambiguity would
+directly undermine a test result's validity.
+
+### Q12 — Should the Makefile enforce `-Werror` so a missing `EventType`
+switch case fails the build instead of crashing at runtime?
+The `GOSSIP_NO_PEERS` crash (see `PROGRESS.md`, "Bugs caught during
+implementation") happened because `toString(EventType)`'s switch was
+missing a case — and it compiled successfully anyway. Checked the
+Makefile: `-Wall` is set, and `-Wswitch` (which would flag exactly this) is
+part of `-Wall`, so the warning *is* being emitted. But there's no
+`-Werror`, so the warning doesn't fail the build — the exact bug that
+already happened once could happen again on a future `EventType` addition
+and still produce a "successful" compile.
+
+**Resolution:** not being adopted right now — deprioritized by explicit
+request. `-Werror` would also hard-fail the build on any warning from
+generated protobuf/gRPC code, not just hand-written code, which is a real
+cost worth being aware of if this gets revisited (the usual mitigation is
+scoping it narrower, e.g. `-Werror=switch`, rather than blanket
+`-Werror`).
+
+*Context:* raised while closing out Phase 1's status-endpoint session.

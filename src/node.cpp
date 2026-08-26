@@ -19,6 +19,28 @@ namespace {
             std::chrono::system_clock::now().time_since_epoch()
         ).count();
     }
+
+    // permanent now — backs GetStatus. Sorted by node_id so output is
+    // diffable across nodes when comparing status calls by hand.
+    std::string dumpTable(const driftstore::MembershipTable& table) {
+        std::vector<std::string> keys;
+        for (const auto& [node_id, entry] : table.entries()) {
+            keys.push_back(node_id);
+        }
+        std::sort(keys.begin(), keys.end());
+
+        std::string out = "table_size=" + std::to_string(keys.size()) + " entries=[";
+        for (size_t i = 0; i < keys.size(); ++i) {
+            const auto& entry = table.entries().at(keys[i]);
+            out += keys[i] + ":" +
+                (entry.status() == driftstore::UP ? "UP" : "REMOVED") +
+                ":w=" + entry.writer_id() +
+                ":t=" + std::to_string(entry.last_updated());
+            if (i + 1 < keys.size()) out += ",";
+        }
+        out += "]";
+        return out;
+    }
     
 }  // namespace
 
@@ -53,11 +75,24 @@ public:
     }
 
     grpc::Status Ping(grpc::ServerContext* /*context*/,
-                const driftstore::PingRequest* request,
-                driftstore::PingResponse* response) override {
+                      const driftstore::PingRequest* request,
+                      driftstore::PingResponse* response) override {
         logEvent(EventType::PING_RECEIVED, node_id_,
         "sender=" + request->sender_node_id());
         response->set_responder_node_id(node_id_);
+        return grpc::Status::OK;
+    }
+
+    grpc::Status GetStatus(grpc::ServerContext* /*context*/,
+                           const driftstore::StatusRequest* /*request*/,
+                           driftstore::StatusResponse* response) override {
+        driftstore::MembershipTable snapshot;
+        {
+            std::lock_guard<std::mutex> lock(table_mutex_);
+            snapshot = table_;
+        }
+        response->set_node_id(node_id_);
+        response->set_table_dump(dumpTable(snapshot));
         return grpc::Status::OK;
     }
 

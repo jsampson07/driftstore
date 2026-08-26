@@ -21,6 +21,17 @@ scaffolding either way. Now also used for `--status` queries, which have no
 noting `client.cpp` now has two somewhat different identities depending on
 mode (a fabricated node identity for Ping, no identity at all for status).
 
+**Update, `RemoveNode` session:** now a third mode, `--remove=<node_id>`,
+also with no `--self` identity — same shape as `--status`. Separately, this
+session also surfaced a real naming-collision bug in this exact file's
+vicinity: the proto field that became `RemoveRequest.removed_node_id` was
+originally drafted as `target_node_id`, which collided with `--target`'s
+already-established meaning ("address this client dials"), not the node
+being acted on. Caught and renamed before landing — but it's a concrete
+example of the identity-mess this question is about, not just an abstract
+worry anymore. Doesn't resolve Q2, but raises the cost of leaving it
+unresolved as more modes accumulate on one binary.
+
 ### Q3 — Does GTStore's `storage` / `test_app` need an explicit manager address?
 `harness/smoke_test.sh` assumes `storage --port $PORT` and `test_app` locate
 the manager via a hardcoded default (localhost + some fixed port), since no
@@ -61,28 +72,21 @@ address, permanently" is an acceptable simplification for its intended scale.
 *Status:* unresolved, not blocking — surfaced while fixing the `self_entry` constructor
 bug (Phase 1 gossip session), not yet acted on anywhere.
 
-### Q8 — Should `SendGossip` surface RPC success/failure explicitly to its caller?
-Currently `SendGossip` returns a plain `GossipResponse`, with the
-`grpc::Status` checked (and logged as `GOSSIP_SUCCEEDED`/`GOSSIP_FAILED`)
-only inside `SendGossip` itself, then discarded. `gossipRound` calls
-`applyGossip(response.table())` unconditionally, with no way to know which
-case it's in. This currently works out safely only because gRPC's contract
-leaves the out-parameter untouched (default-constructed, empty `map`) on
-failure, and a live responder's table can never actually be empty — but
-`gossipRound` doesn't check for either of those things, it just happens to
-be protected by both holding. Options: leave as-is (works, but the safety
-is implicit and unverified by the caller); change `SendGossip`'s signature
-to something like `std::optional<GossipResponse>` so `gossipRound` can skip
-the `applyGossip` call outright on failure instead of relying on an
-incidental no-op.
-
-*Status:* unresolved, not blocking — current behavior is correct as far as
-tested, but the correctness rests on an assumption the code doesn't
-enforce. Raised while tracing the gossip round end-to-end from memory.
-Directly relevant to the upcoming `bootstrapFromSeed` retry/backoff design —
-retry logic needs to distinguish "RPC failed, retry" from "RPC succeeded,"
-so this may get forced into resolution as part of that work rather than
-resolved standalone.
+**Update, `RemoveNode`/reboot-detection session:** this stopped being purely
+hypothetical. During ad hoc manual testing of `NODE_REBOOTED`, a second
+`node` process was started on an address a first process already held.
+Because `AddListeningPort`'s failure is silent (Q11), the second process
+kept running as an outbound-only gossip client while never actually being
+reachable — two live processes briefly answering to one `node_id`
+simultaneously, which is exactly the "identity and process lifetime
+diverge" scenario this question asks about. Produced a real, confusing log
+line (a process appearing to log `NODE_REBOOTED` about itself, which should
+be structurally impossible — see `PROGRESS.md`). Did not reproduce once
+testing moved to the scripted harness, which starts from a clean
+`pkill`'d state each run. Worth treating as a concrete argument for
+resolving this question before Phase 8's kill/restart fault injection
+deliberately creates the exact conditions that produced it here by
+accident.
 
 ### Q9 — No error handling on `--gossip-interval`'s parse in `main()`
 `std::stoll(gossip_interval_ms)` throws on malformed input (e.g.
@@ -119,23 +123,50 @@ worth checking whether `client.cpp` sets any RPC deadline at all. Notably,
 still doesn't, so the asymmetry is now visible directly in the source, not
 just suspected.
 
-### Q5 — Does admin `remove` need to target a designated seed, same as bootstrap?
-The ordered-fallback-with-backoff seed mechanism (250ms timeout, exponential
-backoff, 3-try cap) was designed to solve "an actor with zero prior cluster
-knowledge needs a first point of contact" — which is necessarily true for a
-brand-new node joining (it only has its `--seed` launch flags to go on).
-It's not obviously true for an admin issuing a `remove` command: the admin
-already stood up the cluster and may already know the address of any live
-node, not just a seed. ARCHITECTURE_1.md's draft answer says both join and
-remove should require targeting a seed, but that may just be the join
-answer copy-pasted without re-checking whether the restriction is necessary
-for remove too. Raised during Phase 1 proto/schema work.
+### Q13 — Should seed membership ever become dynamic (promotion/discovery) instead of a static admin-declared list?
+Raised during `bootstrapFromSeed` retry/backoff design: with `--seed` now
+accepting a list rather than a single address, worth asking whether that
+list should ever be populated dynamically — nodes "promoted" to seed status
+at runtime, or resolved via an external discovery mechanism (DNS SRV
+records, cloud-provider instance tagging, etc.) — instead of being a fixed
+set every node is handed identically at launch.
 
-*Status:* unresolved, not blocking — doesn't affect the `GossipExchange`
-proto/schema work already landed. Matters once the admin join/remove RPC
-gets designed. Flagged as taste/consistency, not correctness. Will need
-answering as part of the now-next-up admin join/remove design, after
-retry/backoff lands.
+*Status:* unresolved, explicitly deferred by request ("I won't worry about
+it for now, I will address it when it comes up"). Reasoning for choosing
+static-for-now, on record in case this gets revisited: any dynamic scheme
+still needs *some* fixed way for a brand-new node (zero cluster knowledge,
+by definition) to learn the *current* seed set before it can join at all —
+which either reduces to a static bootstrap list anyway (just one for
+discovering seeds instead of joining directly), or introduces an external
+discovery dependency that's authoritative about current seed identity,
+which is structurally similar to the manager SPOF this project set out not
+to have, even if it wouldn't be called a "manager." Cassandra's own
+`seeds` config (static, admin-picked, no automatic rotation/election) was
+used as rough precedent for the static-list decision.
+
+*Context:* raised during Phase 1 `bootstrapFromSeed` retry/backoff design.
+
+### Q15 — `REMOVE_INIT` and `REMOVE_FAILED` are declared but never logged
+`logging.hpp` has both an `EventType` enum entry and a `toString()` case
+for `REMOVE_INIT` and `REMOVE_FAILED`, but nothing in `RemoveNode`
+actually calls `logEvent` with either one. Specifically, the not-found
+branch (`removed_node_id` never seen — `accepted=false`) has no `logEvent`
+call of any kind — an admin removing an unrecognized node currently
+produces zero log trail on the node that rejected the request. Found
+while auditing the code to update these docs, not caught during the
+original implementation/review pass.
+
+*Status:* unresolved, not blocking, but worth weighing directly against
+the project's stated debugging philosophy — structured/correlated logging
+is supposed to be the primary tool here, and this is a request outcome
+with no log evidence at all. Two ways to close it: add a `REMOVE_FAILED`
+call on the not-found path (and decide whether `REMOVE_INIT` is worth
+keeping if nothing ever calls it either), or deliberately drop the two
+unused enum values if a silent rejection is judged acceptable. Either is
+a small change; the open part is which one is actually wanted.
+
+*Context:* raised while updating `PROGRESS.md`/`OPEN_QUESTIONS.md` after
+the `RemoveNode`/reboot-detection session.
 
 ---
 
@@ -157,6 +188,18 @@ a last-writer-wins register, structurally a state-based CRDT).
 *Context:* raised at the start of Phase 1's gossip design.
 *Relevant reading:* Dynamo paper, §4.8.1 "Ring Membership."
 *Full reasoning:* `driftstore-phase1-design-decisions.md`.
+
+**Related edge case, not treated as a new problem:** surfaced during
+`bootstrapFromSeed` retry/backoff design — a node rebooting on the same
+address (per Q7, `node_id` *is* the listen address) can receive gossip from
+a peer that still has a stale pre-crash entry for it while bootstrap is
+still retrying. LWW means the node's own fresh self-entry, timestamped at
+construction on this boot, beats that stale incoming entry — but only as
+long as local wall-clock ordering is trustworthy across the reboot. An
+unsynced clock immediately after boot (pre-NTP-sync) could in principle let
+a stale incoming entry out-timestamp the fresh self-entry. Same trust
+assumption Q1 already accepts project-wide for LWW generally — not a new
+problem, just a concrete scenario where it could actually bite.
 
 ### Q6 — Gossip target selection: whole table, or `UP`-only entries?
 Should the periodic gossip round pick a random peer from every entry in the
@@ -199,6 +242,14 @@ apart from healthy startup in that node's own logs. Worth fixing before
 Phase 8's kill/restart fault injection, where this exact ambiguity would
 directly undermine a test result's validity.
 
+**Update, `RemoveNode`/reboot-detection session:** this gap stopped being
+purely theoretical — it was the direct root cause of a real confusing
+debugging session (a silently-failed second bind produced a `NODE_REBOOTED`
+log that looked like a node revived itself, see `PROGRESS.md` and Q7's
+update above). Raising this from "worth fixing before Phase 8" to "has
+already produced one real incident outside of Phase 8" — still not fixed,
+but the priority case is no longer hypothetical.
+
 ### Q12 — Should the Makefile enforce `-Werror` so a missing `EventType`
 switch case fails the build instead of crashing at runtime?
 The `GOSSIP_NO_PEERS` crash (see `PROGRESS.md`, "Bugs caught during
@@ -218,3 +269,91 @@ scoping it narrower, e.g. `-Werror=switch`, rather than blanket
 `-Werror`).
 
 *Context:* raised while closing out Phase 1's status-endpoint session.
+
+### Q5 — Does admin `remove` need to target a designated seed, same as bootstrap?
+The ordered-fallback-with-backoff seed mechanism (250ms timeout, exponential
+backoff, 3-try cap) was designed to solve "an actor with zero prior cluster
+knowledge needs a first point of contact" — which is necessarily true for a
+brand-new node joining (it only has its `--seed` launch flags to go on).
+It's not obviously true for an admin issuing a `remove` command: the admin
+already stood up the cluster and may already know the address of any live
+node, not just a seed.
+
+**Resolution:** No — `remove` does not need seed-targeting. The seed
+mechanism specifically solves "zero cluster knowledge, needs a first
+contact," which is true by definition for a joining node and not true for
+an admin issuing `remove`: naming a `removed_node_id` in the request
+already requires knowing that node's address, so the admin trivially has
+at least one live address to send the RPC to (the target node itself, or
+any other node they already know about). `RemoveNode` can be sent to any
+node the admin knows is live — no retry/backoff, no seed restriction.
+
+Also resolved alongside this: whether a separate admin `Join` RPC was
+needed at all. It isn't — `bootstrapFromSeed` plus the self-entry written
+at construction plus ordinary gossip propagation already cover a new
+node's presence becoming known cluster-wide with no admin action
+required. Only `remove` needed new RPC surface.
+
+*Context:* raised during Phase 1 proto/schema work.
+*Resolved during:* the `RemoveNode`/reboot-detection design and
+implementation session — see `PROGRESS.md`.
+
+### Q8 — Should `SendGossip` surface RPC success/failure explicitly to its caller?
+Currently `SendGossip` returned a plain `GossipResponse`, with the
+`grpc::Status` checked (and logged as `GOSSIP_SUCCEEDED`/`GOSSIP_FAILED`)
+only inside `SendGossip` itself, then discarded. Both callers applied the
+response unconditionally, relying on gRPC leaving the out-param untouched
+(default-constructed, empty `map`) on failure rather than checking for
+success explicitly.
+
+**Resolution:** Changed `SendGossip`'s return type to
+`std::optional<driftstore::GossipResponse>` — `std::nullopt` on RPC
+failure, the response wrapped in `optional` on success. Both callers
+(`gossipRound`, `bootstrapFromSeed`) now check `if (response)` explicitly
+before calling `applyGossip`, rather than relying on the previous implicit,
+unverified-by-the-caller safety.
+
+Considered and rejected: also exposing the `grpc::Status` itself (e.g. via
+`std::pair<grpc::Status, GossipResponse>` or an out-param), specifically to
+distinguish a genuinely dead peer from one that's merely slow or
+partitioned. Rejected because (a) no caller branches on failure *type*,
+only failure-or-not — the locked retry/backoff design (see `PROGRESS.md`)
+retries uniformly regardless of why an attempt failed, and (b) the
+underlying problem this would be solving — telling "dead" apart from
+"slow" — isn't actually solvable from a single RPC's status code in an
+asynchronous network; a lost message and an arbitrarily delayed one look
+identical from the caller's side. That distinction, when it matters,
+belongs to Phase 3's reachability tracking (built on aggregated signal —
+consecutive-failure counts, latency history — not one call's status), not
+to this return type.
+
+Also considered: a named result struct (`SendGossipResult { bool ok;
+GossipResponse response; }`) instead of bare `std::optional`, for
+readability at call sites. Deferred — `std::optional<GossipResponse>` says
+everything currently needed; converting to a struct later (e.g. if a
+per-call field like round-trip latency is ever needed) is a small,
+low-risk refactor when that need actually materializes, not before.
+
+*Context:* raised while tracing the gossip round end-to-end from memory.
+*Resolved during:* this chat's `bootstrapFromSeed` retry/backoff design and
+implementation thread.
+
+### Q14 — Does `main()`'s bootstrap-failure exit path need an explicit `server->Shutdown()` before returning?
+`main()` exits (`return 1`) if `bootstrapFromSeed` exhausts all 3 retry
+passes without success — the first place in this codebase a process needs
+to exit while a `grpc::Server` object exists but was never explicitly
+`Shutdown()`'d (every other path reaches `server->Wait()` and blocks
+forever instead). Unconfirmed whether `grpc::Server`'s destructor handles
+an un-`Shutdown()`'d server cleanly on process exit.
+
+**Resolution:** tested empirically against an all-unreachable seed list.
+The process exits promptly and cleanly with exit code `1` on this path — no
+explicit `server->Shutdown()` call is necessary. (Note on the test itself,
+for anyone rerunning this: measuring the exit code through a `| tee` pipe
+gives `tee`'s exit code, not `node`'s, via the standard `$?`-after-a-pipeline
+gotcha — use `${PIPESTATUS[0]}`, or redirect directly without a pipe, to
+measure the actual process's exit code.)
+
+*Context:* raised during `bootstrapFromSeed` retry/backoff design, this
+chat.
+*Resolved during:* same thread, via the dead-seed-list empirical test.

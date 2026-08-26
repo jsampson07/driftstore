@@ -146,28 +146,6 @@ used as rough precedent for the static-list decision.
 
 *Context:* raised during Phase 1 `bootstrapFromSeed` retry/backoff design.
 
-### Q15 — `REMOVE_INIT` and `REMOVE_FAILED` are declared but never logged
-`logging.hpp` has both an `EventType` enum entry and a `toString()` case
-for `REMOVE_INIT` and `REMOVE_FAILED`, but nothing in `RemoveNode`
-actually calls `logEvent` with either one. Specifically, the not-found
-branch (`removed_node_id` never seen — `accepted=false`) has no `logEvent`
-call of any kind — an admin removing an unrecognized node currently
-produces zero log trail on the node that rejected the request. Found
-while auditing the code to update these docs, not caught during the
-original implementation/review pass.
-
-*Status:* unresolved, not blocking, but worth weighing directly against
-the project's stated debugging philosophy — structured/correlated logging
-is supposed to be the primary tool here, and this is a request outcome
-with no log evidence at all. Two ways to close it: add a `REMOVE_FAILED`
-call on the not-found path (and decide whether `REMOVE_INIT` is worth
-keeping if nothing ever calls it either), or deliberately drop the two
-unused enum values if a silent rejection is judged acceptable. Either is
-a small change; the open part is which one is actually wanted.
-
-*Context:* raised while updating `PROGRESS.md`/`OPEN_QUESTIONS.md` after
-the `RemoveNode`/reboot-detection session.
-
 ---
 
 ## Resolved

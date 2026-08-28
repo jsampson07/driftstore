@@ -637,7 +637,7 @@ die."
 
 ---
 
-## Phase 2 — Consistent hashing ring + virtual nodes (design locked, implementation starting)
+## Phase 2 — Consistent hashing ring + virtual nodes (Done)
 
 Full design worked out in conversation before any code was written, per this
 project's own rule that correctness-critical logic gets designed and
@@ -780,6 +780,118 @@ gossip targets, whether inbound `GossipExchange` should also decline to
 merge once self-status is `REMOVED`, and whether a `REMOVED` node should
 decline to coordinate once Phase 3 exists.
 
+### Bugs caught during implementation
+
+**`mergeInto`'s `UP→REMOVED` branch — wrong entry's tokens.** While writing
+the ring-erase branch, it wasn't obvious by inspection whether to erase
+`incoming_entry.tokens()` or `local_entry.tokens()` — both compile, both
+look plausible. The correct answer is `local_entry.tokens()`: by the time a
+`REMOVED` entry is gossiped, `RemoveNode` has already called
+`clear_tokens()` on it at the source, so `incoming_entry.tokens()` is empty
+and erasing from it is a silent no-op — the ring keeps a removed node's
+tokens forever on any node that only ever learns about the removal
+secondhand. The tokens that actually need erasing are the ones still
+sitting in `ring_` from before this update, which live on `local_entry`,
+read *before* the unconditional `(*local_entries)[node_id] = incoming_entry`
+overwrite a few lines below — `local_entry` is a reference into the same
+map slot that assignment mutates, not a copy, so ordering matters.
+
+**Table-write regression, introduced while fixing the bug above.** An
+intermediate draft moved `(*local_entries)[node_id] = incoming_entry` inside
+the `REMOVED→UP` branch specifically, alongside its ring-insert logic. That
+left the table write conditional on the transition type instead of on
+`incoming_wins` alone — an ordinary `UP→UP` refresh (most real gossip
+traffic) or a same-transition `UP→REMOVED` update stopped reaching `table_`
+at all, silently breaking basic LWW convergence. Fixed by pulling the write
+back out to run unconditionally whenever `incoming_wins`, with the two
+transition-specific branches only handling the ring side effect.
+
+**Vnode-distribution experiment — FNV-1a's weak diffusion on near-identical
+inputs.** First run of `vnode_experiment.cpp` showed `stddev` identical to
+two decimal places between `V=1` and `V=4`, and *worse* distribution at
+`V=16`/`V=64` than at `V=1` — the opposite of the expected monotonic
+improvement. Root cause: `token_i = fnv1a64(node_id + ":" + i)` for
+sequential single-digit `i` produces token strings identical except for
+their final byte, and two FNV-1a inputs differing only in their last byte —
+processed as `hash ^= byte; hash *= prime` with no further mixing —
+produce outputs differing by exactly `1 × prime` (`1,099,511,628,211`,
+confirmed by direct computation). Against a 64-bit space of ~1.8×10^19,
+that's a rounding error: a node's first ten vnodes (`i=0`–`9`) all land
+within a span of ~10×prime, functionally one point on the ring regardless
+of `V`. Crossing a digit-length boundary (`i=9→10`, `i=99→100`) adds a full
+extra input byte and jumps by ~10^17–10^18 — which is *why* `V=16`/`64`
+looked slightly better (some vnodes now have 2-digit suffixes) and `V=256`
+better still (some have 3), rather than a clean curve.
+
+First fix attempt was wrong, and empirically, not just in hindsight:
+tried reordering to `fnv1a64(i + ":" + node_id)`, on the theory that
+putting the varying byte first gives the fixed suffix more bytes to mix
+through afterward. Made `V=1`/`V=4` *catastrophically* worse instead
+(`stddev=40000`, one node getting literally 100% of keys) — moving the
+short low-entropy field to the front just clusters across the 5 physical
+nodes instead of across one node's vnodes, since `"node0"`–`"node4"` have
+the exact same last-byte-only-differs problem `node_id` did originally.
+Caught by re-running the same measurement before trusting the fix, not by
+reasoning alone.
+
+**Actual fix:** a standard 64-bit bit-mixing finalizer (`splitmix64`-style,
+fixed published constants) applied *after* `fnv1a64`'s output, not a change
+to the input string at all:
+```cpp
+uint64_t mix64(uint64_t x) {
+    x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27; x *= 0x94d049bb133111ebULL;
+    x ^= x >> 31;
+    return x;
+}
+```
+Applied uniformly to both token derivation (`computeTokens`) and key
+hashing (`preferenceListForKey`) — required by this phase's own "one
+comparable space" principle above; fixing only one side would leave tokens
+and keys positioned via different transforms. `fnv1a64` itself is
+unchanged and still correct as a primitive; `mix64` is a wrapper, not a
+replacement. Result, `V` swept against 5 physical nodes / 100k keys:
+
+| V   | stddev (before) | stddev (after) |
+|-----|-----------------|-----------------|
+| 1   | 28806.93         | 18022.65 |
+| 4   | 28806.93 (=V=1)  | 11054.46 |
+| 16  | 16205.95         | 4712.36  |
+| 64  | 16219.99         | 3496.91  |
+| 256 | 13441.57         | 1304.57  |
+
+Clean monotonic decrease after the fix, roughly tracking the `1/√V`
+scaling expected for points scattered on a circle. Residual imbalance at
+`V=256` (~1300 stddev against a 20000 mean, ~6.5%) doesn't go to zero and
+isn't expected to — that's inherent to placing points randomly rather than
+computing a provably even partition, not a sign the fix is incomplete.
+
+### Verification status
+
+`test_ring.cpp` now covers three of the five ring-mutation points:
+new-node discovery (test 1), and `REMOVED→UP`/`UP→REMOVED` together via a
+chained lifecycle test (`testReboot`) that reuses one entry across
+new-node → remove → reboot, checking both `local` and `ring` after each
+step. That removal step is real regression coverage for the two bugs
+above — it constructs `incoming_entry` with empty tokens via
+`clear_tokens()`, matching production behavior, and asserts
+`ring.count(t0) == 0` afterward, which fails against the old
+`incoming_entry.tokens()` version.
+
+Two gaps remain, both explicitly accepted rather than overlooked:
+- **`RemoveNode`'s direct erasure** has no test coverage. It isn't a free
+  function like `mergeInto`/`preferenceList`, so covering it needs either a
+  live gRPC round trip or a further refactor to extract its ring-erase
+  logic the same way. Deferred as tracked debt.
+- **Same-status `UP→UP` refresh** — the path with no dedicated branch in
+  `mergeInto`, the one the table-write regression actually broke — has no
+  regression test. Declined deliberately, not missed: the fix is
+  understood and the regression it guards against is already fixed in the
+  current code, but a future refactor that reintroduces it would go
+  uncaught.
+
+Both tracked as Q17 in `OPEN_QUESTIONS.md`.
+
 ### GTStore comparisons made this session
 - **Preference-list computation from one authoritative center vs. computed
   independently by every node.** GTStore's `GetNodeForKey` is one function
@@ -801,6 +913,20 @@ decline to coordinate once Phase 3 exists.
   relative to `num_buckets` at that instant, recomputed by the manager
   whenever `N` changes — nothing about it needs to survive a restart,
   because nothing about it is owned by any single node to begin with.
+- **Exact balance vs. bounded movement, made concrete by the
+  vnode-distribution numbers above.** GTStore's `key % num_buckets` gives
+  perfectly even load by construction — no stddev to measure, because it's
+  dividing directly rather than scattering points and hoping. What it can't
+  give: when `num_buckets` changes, nearly every key's assignment changes
+  with it, since the modulus itself changed. Driftstore's ring keeps a
+  residual, measured imbalance even at `V=256` (~6.5% of mean) in exchange
+  for a join or leave only reassigning the ~1/N slice of keyspace between
+  the changed node and its ring neighbor. Same trade as the multi-coordinator
+  point above, from a different angle: GTStore pays its membership-change
+  cost all at once, structurally, because there's only one bucket count to
+  recompute from; Driftstore pays a small continuous cost (imbalance) to
+  avoid paying a large discrete one (mass reassignment) whenever membership
+  moves.
 
 ## How to update this file
 When a phase wraps: flip its status in the table, add a summary block (what

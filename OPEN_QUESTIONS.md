@@ -172,6 +172,36 @@ way.
 *Status:* unresolved, explicitly deferred to Phase 3 design.
 *Context:* raised alongside Q15, Phase 2 design conversation.
 
+### Q17 — Phase 2's ring-mutation test coverage: two of five points still open, by choice
+`test_ring.cpp` now covers three of the five ring-mutation points —
+new-node discovery, and `REMOVED→UP`/`UP→REMOVED` via a chained
+`testReboot` lifecycle test that checks both `local` and `ring` at each
+step. The removal step is genuine regression coverage for the two
+`UP→REMOVED` bugs found during implementation (see `PROGRESS.md`): its
+`incoming_entry` is built with empty tokens via `clear_tokens()`, matching
+production, and would fail against the old buggy version.
+
+Two points remain open, both a deliberate decision, not an oversight:
+- **`RemoveNode`'s direct erasure** — not a free function, so covering it
+  needs a live gRPC round trip or a further extraction of its ring-erase
+  logic. No live multi-node test has ever touched any Phase 2 code, and
+  there's still no RPC/CLI surface exposing `ring_`/`preferenceList`
+  externally.
+- **Same-status `UP→UP` refresh** — the path with no dedicated `mergeInto`
+  branch, the one the table-write regression actually broke. Declined
+  knowingly: a future refactor that reintroduces that regression would go
+  uncaught by anything currently in the suite.
+
+Options unchanged from before: (a) close either or both later, (b) accept
+as carried debt into Phase 3, (c) a minimal debug RPC exposing
+`ring_`/`preferenceList`, which would help both this and the general
+live-observability gap.
+
+*Status:* unresolved, explicitly accepted as open debt — Phase 2 declared
+done with this gap known and documented, not discovered later.
+*Context:* surfaced closing out Phase 2; narrowed after `testReboot` was
+added; final scope decided explicitly rather than by default.
+
 ---
 
 ## Resolved

@@ -33,5 +33,15 @@ $(BIN_DIR)/client: src/client.cpp $(PROTO_GEN)
 	mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) src/client.cpp $(PROTO_GEN) $(LFLAGS) -o $(BIN_DIR)/client
 
+# Not a dependency of "all" — test binaries are dev tooling, not something every
+# ordinary build should pay to compile. Build explicitly with "make bin/test_ring".
+$(BIN_DIR)/test_ring: src/test_ring.cpp src/ring.hpp $(PROTO_GEN)
+	mkdir -p $(BIN_DIR)
+	$(CC) $(CFLAGS) src/test_ring.cpp src/driftstore.pb.cc $(LFLAGS) -o $(BIN_DIR)/test_ring
+
+$(BIN_DIR)/vnode_experiment: src/vnode_experiment.cpp src/ring.hpp $(PROTO_GEN)
+	mkdir -p $(BIN_DIR)
+	$(CC) $(CFLAGS) src/vnode_experiment.cpp src/driftstore.pb.cc $(LFLAGS) -o $(BIN_DIR)/vnode_experiment
+
 clean:
 	$(RM) src/*.pb.cc src/*.pb.h $(BIN_DIR)/*

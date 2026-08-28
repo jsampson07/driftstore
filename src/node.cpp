@@ -1,5 +1,6 @@
 #include "driftstore.grpc.pb.h"
 #include "logging.hpp"
+#include "ring.hpp"
 
 #include <grpcpp/grpcpp.h>
 
@@ -12,6 +13,8 @@
 #include <vector>
 #include <iostream>
 #include <sstream>
+#include <map>
+#include <unordered_set>
 
 namespace {
 
@@ -51,33 +54,6 @@ PUBLIC METHODS
 */
 
 
-void mergeInto(driftstore::MembershipTable& local, const driftstore::MembershipTable& incoming, const std::string& caller_node_id) {
-    auto* local_entries = local.mutable_entries();
-    for (const auto& [node_id, incoming_entry] : incoming.entries()) {
-        auto it = local_entries->find(node_id);
-        if (it == local_entries->end()) {
-            (*local_entries)[node_id] = incoming_entry;
-            continue;
-        }
-        const auto& local_entry = it->second;
-        if (incoming_entry.last_updated() > local_entry.last_updated()) {
-            if (local_entry.status() == driftstore::REMOVED && incoming_entry.status() == driftstore::UP) {
-                logEvent(EventType::NODE_REBOOTED, caller_node_id, "node_id=" + node_id + " status=" + toString(driftstore::UP) + 
-                        " writer_id=" + incoming_entry.writer_id() + " last_updated=" + std::to_string(incoming_entry.last_updated()));
-            }
-            (*local_entries)[node_id] = incoming_entry;
-        } else if (incoming_entry.last_updated() == local_entry.last_updated()) {
-            if (incoming_entry.writer_id() > local_entry.writer_id()) {
-                if (local_entry.status() == driftstore::REMOVED && incoming_entry.status() == driftstore::UP) {
-                    logEvent(EventType::NODE_REBOOTED, caller_node_id, "node_id=" + node_id + " status=" + toString(driftstore::UP) + 
-                            " writer_id=" + incoming_entry.writer_id() + " last_updated=" + std::to_string(incoming_entry.last_updated()));
-                }
-                (*local_entries)[node_id] = incoming_entry;
-            }
-        }
-    }
-}
-
 std::vector<std::string> splitSeeds(const std::string& raw) {
     std::vector<std::string> result;
     std::stringstream ss(raw);
@@ -93,12 +69,17 @@ std::vector<std::string> splitSeeds(const std::string& raw) {
 
 class NodeServiceImpl final : public driftstore::DriftStoreNode::Service {
 public:
-    explicit NodeServiceImpl(std::string node_id) : node_id_(std::move(node_id)) {
+    explicit NodeServiceImpl(std::string node_id, int vnodes) : node_id_(std::move(node_id)), vnodes_(vnodes) {
         driftstore::MembershipEntry self_entry;
         self_entry.set_writer_id(node_id_);
         self_entry.set_address(node_id_);
         self_entry.set_status(driftstore::UP);
         self_entry.set_last_updated(nowMillis());
+        std::vector<uint64_t> tokens = computeTokens(node_id_, vnodes_);
+        for (uint64_t token : tokens) {
+            self_entry.add_tokens(token);
+            ring_[token] = node_id_;
+        }
         (*table_.mutable_entries())[node_id_] = self_entry;
     }
 
@@ -127,29 +108,32 @@ public:
     grpc::Status RemoveNode(grpc::ServerContext* /* context */,
                          const driftstore::RemoveRequest* request,
                          driftstore::RemoveResponse* response) override {
-    std::lock_guard<std::mutex> lock(table_mutex_);
-    auto* entries = table_.mutable_entries();
-    auto it = entries->find(request->removed_node_id());
-    if (it == entries->end()) {
-        response->set_accepted(false);
-    } else {
-        if (it->second.status() == driftstore::REMOVED) {
-            // No-op
+        std::lock_guard<std::mutex> lock(table_mutex_);
+        auto* entries = table_.mutable_entries();
+        auto it = entries->find(request->removed_node_id());
+        if (it == entries->end()) {
+            response->set_accepted(false);
         } else {
-            it->second.set_status(driftstore::REMOVED);
-            it->second.set_writer_id(node_id_);
-            it->second.clear_tokens();
-            it->second.set_last_updated(nowMillis());
+            if (it->second.status() == driftstore::REMOVED) {
+                // No-op
+            } else {
+                it->second.set_status(driftstore::REMOVED);
+                it->second.set_writer_id(node_id_);
+                for (const auto& token : it->second.tokens()) {
+                    ring_.erase(token);
+                }
+                it->second.clear_tokens();
+                it->second.set_last_updated(nowMillis());
+            }
+            response->set_accepted(true);
+            logEvent(EventType::REMOVE_SUCCEEDED, node_id_,
+                "node_id=" + request->removed_node_id() +
+                " status=" + (it->second.status() == driftstore::UP ? "UP" : "REMOVED") +
+                " writer_id=" + node_id_ +
+                " last_updated=" + std::to_string(it->second.last_updated()));
         }
-        response->set_accepted(true);
-        logEvent(EventType::REMOVE_SUCCEEDED, node_id_,
-            "node_id=" + request->removed_node_id() +
-            " status=" + toString(driftstore::REMOVED) +
-            " writer_id=" + node_id_ +
-            " last_updated=" + std::to_string(it->second.last_updated()));
+        return grpc::Status::OK;
     }
-    return grpc::Status::OK;
-}
 
     // Call once from main(), after BuildAndStart() — mirrors bootstrapFromSeed's
     // placement: the node must be reachable as a server before it starts acting
@@ -218,8 +202,13 @@ public:
     */
     driftstore::MembershipTable applyGossip(const driftstore::MembershipTable& incoming) {
         std::lock_guard<std::mutex> lock(table_mutex_);
-        mergeInto(table_, incoming, node_id_);
+        mergeInto(table_, incoming, node_id_, ring_);
         return table_;
+    }
+
+    std::vector<std::string> preferenceListForKey(const std::string& key, int N) {
+        std::lock_guard<std::mutex> lock(table_mutex_);
+        return preferenceList(ring_, mix64(fnv1a64(key)), N);
     }
     
     bool bootstrapFromSeed(const std::vector<std::string>& seeds) {
@@ -252,8 +241,10 @@ public:
 
 private:
     std::string node_id_;
-    driftstore::MembershipTable table_; // need to initialize this !!!
+    int vnodes_;
+    driftstore::MembershipTable table_;
     std::mutex table_mutex_;
+    std::map<uint64_t, std::string> ring_;
 
     void gossipLoop(int64_t gossip_interval_ms) {
         while (true) {
@@ -312,36 +303,52 @@ private:
         std::uniform_int_distribution<std::size_t> dist(0, candidates.size() - 1);
         return candidates[dist(gen)];
     }
+
+    std::vector<uint64_t> computeTokens(const std::string& node_id, int V) {
+        // We are given a node id and the number of tokens this node will have
+        std::vector<uint64_t> tokens;
+        for (int i = 0; i < V; i++) {
+            uint64_t token_i = mix64(fnv1a64(node_id + ":" + std::to_string(i)));
+            tokens.push_back(token_i);
+        }
+        return tokens;
+    }
 };
 
 int main(int argc, char** argv) {
     std::string listen;
     std::string seed_arg;  // possibly comma-separated
     std::string gossip_interval_ms = "1000";
+    std::string vnodes_str = "32";
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         static constexpr char kListenPrefix[] = "--listen=";
         static constexpr char kSeedPrefix[] = "--seed=";
         static constexpr char kGossipIntervalPrefix[] = "--gossip-interval=";
+        static constexpr char kVnodesPrefix[] = "--vnodes=";
         if (arg.rfind(kListenPrefix, 0) == 0) {
             listen = arg.substr(sizeof(kListenPrefix) - 1);
         } else if (arg.rfind(kSeedPrefix, 0) == 0) {
             seed_arg = arg.substr(sizeof(kSeedPrefix) - 1);
         } else if (arg.rfind(kGossipIntervalPrefix, 0) == 0) {
             gossip_interval_ms = arg.substr(sizeof(kGossipIntervalPrefix) - 1);
+        } else if (arg.rfind(kVnodesPrefix, 0) == 0) {
+            vnodes_str = arg.substr(sizeof(kVnodesPrefix) - 1);
         }
     }
     if (listen.empty()) {
         std::fprintf(stderr,
-            "usage: %s --listen=<address> [--seed=<address>[,<address>...]] [--gossip-interval=<time_in_ms>]\n",
+            "usage: %s --listen=<address> [--seed=<address>[,<address>...]] "
+            "[--gossip-interval=<time_in_ms>] [--vnodes=<count>]\n",
             argv[0]);
         return 1;
     }
 
     const std::string& node_id = listen;
+    const int vnodes = std::stoi(vnodes_str);
     logEvent(EventType::NODE_INIT, node_id);
 
-    NodeServiceImpl service(node_id);
+    NodeServiceImpl service(node_id, vnodes);
     grpc::ServerBuilder builder;
     builder.AddListeningPort(listen, grpc::InsecureServerCredentials());
     builder.RegisterService(&service);

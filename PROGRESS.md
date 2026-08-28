@@ -11,7 +11,7 @@
 |---|---|---|
 | 0 | Scaffolding + comparison harness skeleton | ✅ Done |
 | 1 | Gossip membership + local failure detection | ✅ Done |
-| 2 | Consistent hashing ring + virtual nodes | ⬜ Not started |
+| 2 | Consistent hashing ring + virtual nodes | 🔄 In progress |
 | 3 | Any-node coordinator + basic quorum read/write | ⬜ Not started |
 | 4 | Vector clocks + conflict detection | ⬜ Not started |
 | 5 | Hinted handoff | ⬜ Not started |
@@ -524,6 +524,26 @@ of its own status never actually becomes `REMOVED` in the first place.
 (Holds only as long as exactly one live process answers to a given
 `node_id` at a time — see the incident below, and Q7.)
 
+**Correction, caught during Phase 2 design:** the broader claim above — "a
+node's local view of its own status never actually becomes `REMOVED` in the
+first place" — is inaccurate, and was caught by tracing `mergeInto` directly,
+then confirmed empirically (a live, un-killed node was administratively
+removed via a *different* node; its own subsequent `GetStatus` call showed
+itself `REMOVED`). There is no self-entry exemption anywhere in `mergeInto`'s
+comparison logic — a live node's own table entry for itself is exactly as
+overwritable by incoming gossip as any other entry, and does flip to
+`REMOVED` while the process keeps running, because the removal's timestamp
+necessarily outraces the node's construction-time self-entry (removal can
+only happen after the node became known to begin with). The *narrower* claim
+— that `NODE_REBOOTED` specifically can never be logged about self — still
+holds, but for a more precise reason than originally stated: the self-entry
+is written directly into `table_` at construction, bypassing `mergeInto`
+entirely, so the transition-detection branch never has an opportunity to
+fire against a node's own identity from its own process, regardless of what
+its local status is or becomes. Not currently acted on anywhere: a
+live-but-removed node keeps gossiping and keeps behaving normally in every
+other respect — see `OPEN_QUESTIONS.md` Q15/Q16.
+
 **`client.cpp --remove=<node_id>`:** new flag, same shape as `--status` —
 mutually exclusive with `--self`, 2s RPC deadline. Noted, not fixed:
 `accepted=false` (unknown node) and an actual RPC failure both currently
@@ -574,16 +594,6 @@ silent-bind-failure gap) — not a bug in `mergeInto` or `RemoveNode`. Did
 not reproduce in the scripted run, which showed clean single-process
 behavior throughout.
 
-### Open gap found during this session, not yet closed
-
-`EventType::REMOVE_INIT` and `EventType::REMOVE_FAILED` are declared in
-`logging.hpp` (enum entry + `toString()` case) but **not currently
-emitted anywhere.** `RemoveNode`'s not-found path (`accepted=false`) does
-not call `logEvent` at all — an admin attempting to remove an
-unrecognized `node_id` currently produces zero log trail on the node that
-rejected it. Not fixed as part of this session — see `OPEN_QUESTIONS.md`
-Q15.
-
 ### GTStore comparisons made this session
 
 - **Administrative membership changes are a capability GTStore
@@ -626,6 +636,171 @@ these processes talk to each other" rather than "why did this one process
 die."
 
 ---
+
+## Phase 2 — Consistent hashing ring + virtual nodes (design locked, implementation starting)
+
+Full design worked out in conversation before any code was written, per this
+project's own rule that correctness-critical logic gets designed and
+reasoned through directly, not handed to Cursor from a standing start.
+Nothing below is implemented yet — this is the spec implementation follows.
+
+**Q4 resolved.** Phase 2 treats every `UP` member as reachable; the real
+per-peer reachability filter is deferred to Phase 3, once local reachability
+tracking actually produces a signal to consume. Preference-list computation
+this phase is pure ring math — walk clockwise, collect N distinct physical
+nodes, skip only `REMOVED`. Moved to `OPEN_QUESTIONS.md`'s Resolved section.
+
+**Tokens — deterministic, not random+persisted.** `token_i = hash(node_id_ +
+":" + i)` for `i` in `[0, V)`. Considered random tokens (Dynamo's original
+approach, §4.2/§6.1 — chosen uniformly at random from the hash space, then
+persisted to disk so a restart can reload the same mapping) and rejected in
+favor of deterministic derivation: `node_id_` is already a stable, permanent
+identity (Phase 0's address-as-identity decision, made specifically for
+restart stability), so deriving tokens from it gets the same restart-stable
+ring position for free — no disk, no new failure surface (missing file on
+first boot vs. later boots, a crash mid-write leaving a truncated token
+list, directory permissions), and no asymmetry with the rest of the system,
+which persists nothing else at all. This also closes part of Q7's original
+concern from Phase 1: a restarted node reclaiming its *exact* prior ring
+position — needed so Phase 5's hinted-handoff obligations and Phase 6's
+read-repair assumptions about stable ownership survive a restart — is now
+structural, not a separate mechanism that has to be built and kept correct.
+Deterministic derivation is not a lower-fidelity substitute for randomness
+here — a well-mixed hash function applied to a unique, stable seed produces
+output statistically indistinguishable from true randomness for placement
+purposes; the only axis actually being chosen on is whether reproducing a
+node's ring position requires external state.
+
+**Hash function — FNV-1a, 64-bit.** Fixed published spec, no standard-library
+dependency. Deliberately not `std::hash`: the standard makes no guarantee
+`std::hash<std::string>` is stable across different stdlib implementations,
+different versions of the same implementation, or even different runs of the
+same binary (some implementations seed it per-process). That instability
+would be a uniquely nasty bug class here specifically, because two nodes'
+hash functions silently disagreeing on the same input would look, from the
+outside, exactly like a real ring-logic bug — and this project's own planned
+debugging approach for this phase ("feed one snapshot to two nodes' ring
+logic and diff the output") assumes identical inputs produce identical
+output whenever the code is correct. Same function used for both token
+derivation and key hashing, so they land in one comparable space.
+
+**Ring — `std::map<uint64_t, node_id>`, maintained incrementally, not
+derived on demand.** Presence in the map is itself the `UP` signal — no
+separate status field or lookup needed mid-walk. Chosen over deriving the
+ring fresh from `table_` on every lookup mainly on cost grounds (a full
+rebuild-and-sort is paid on every single `put`/`get` once Phase 3 exists,
+and 10k+ times during this phase's own vnode-distribution experiment;
+`std::map`'s ordered-associative structure gives O(log(N·V)) insert/erase/
+lookup with no array-shift cost, so the standing structure is cheaper both
+to build once and to query repeatedly). The sync-risk cost of a second piece
+of state alongside `table_` is real but contained: `table_` currently has
+exactly two mutation surfaces (`mergeInto`, reached only through
+`applyGossip`'s three callers, and `RemoveNode`), both already funneled
+through a small number of choke points from Phase 1's own design — so ring
+updates have the same small number of places to stay correct in.
+
+Ring is updated at **five** points, not the three originally assumed
+mid-design:
+1. **Constructor** — insert own tokens directly, same moment the self-entry
+   is written into `table_`. Necessary for the same reason as the
+   `NODE_REBOOTED` self-invariant above: a node's own entry is never "new"
+   from its own perspective, so it never takes `mergeInto`'s insertion path
+   for itself, no matter how much gossip happens afterward. Missing this
+   would mean a node could compute a preference list that, by hash
+   position, should include itself — and exclude itself, because its own
+   ring never learned it owns those tokens, even though every other node's
+   ring correctly would.
+2. **`RemoveNode`** — erase directly, same construction-bypasses-`mergeInto`
+   reasoning, on the one node that processes the admin RPC.
+3–5. **Inside `mergeInto` itself:** insert on a genuinely new node arriving
+   as `UP`; insert on `REMOVED→UP` (reboot, same branch that already
+   detects `NODE_REBOOTED`); erase on `UP→REMOVED` — a peer learning about a
+   removal *secondhand*, through ordinary gossip propagation, not the node
+   that processed the original RPC. This third `mergeInto` condition was
+   missed in an earlier pass of this design (only the direct `RemoveNode`
+   erase was accounted for) — without it, every node except the one that
+   processed the removal would keep a removed node's tokens live in its
+   ring indefinitely, computing preference lists that silently keep
+   including a node that's been gone for a while. The bug specifically
+   would not show up testing the simple case (check the removing node's own
+   preference lists); it only appears on a node that heard about the
+   removal multi-hop.
+
+**Preference-list walk:** `ring.upper_bound(hash(key))` to find the first
+token clockwise, then walk forward deduping by physical node — an ordered
+`std::vector<node_id>` for the actual result, an `std::unordered_set
+<node_id>` alongside it purely as an O(1)-average "already collected"
+check while walking, not part of the answer itself. Wraps via
+`ring.begin()` on reaching `ring.end()`. Hard-stops after one full pass of
+the ring regardless of whether N was reached, to guarantee termination on a
+cluster with fewer than N distinct physical nodes — the naive
+wraparound-forever version hangs indefinitely on that input rather than
+just returning a wrong answer. Returns a short list (fewer than N distinct
+nodes) in that case; what a caller does with a short list is Phase 3's
+problem, not this function's — the function's only obligation is to
+terminate and report accurately.
+
+**Read/write preference-list asymmetry, worth having settled before Phase 3
+exists:** the preference-list *computation* is identical for a read and a
+write on the same key against the same ring state — neither one "chooses"
+a different list. What differs is downstream capability: per §4.3, Dynamo's
+preference list intentionally contains more than N nodes specifically so a
+write has somewhere to go when it hits an unreachable top-N candidate (push
+a copy onto the next live node further down the same list, as a
+hinted-handoff stand-in). A read hitting that same gap has no equivalent
+move — it can only query nodes that already happen to hold a copy of this
+key (the live top-N members, plus any node currently sitting on a hint for
+it), since querying "the next node in the ring" speculatively would just
+return nothing. Same list; writes can expand where copies physically exist
+when they hit a gap, reads are stuck querying wherever copies already
+landed.
+
+**Multi-coordinator divergence — a new failure class, not yet exercised by
+any code, worth having internalized before Phase 3.** Because every node
+computes its own preference list from its own local ring rather than
+consulting one authoritative source, two coordinators handling the same key
+near-simultaneously, with membership mid-change, can legitimately compute
+two different N-node sets for that key — not a bug in either computation,
+correct relative to what each currently knows. Same underlying cause,
+different exposure, for a read arriving after a write once the ring has
+drifted between the two: the read's computed list can include a node that
+was never part of the original write's list, meaning R+W>N's usual
+"guaranteed overlap" intuition is doing slightly less work than it sounds
+like whenever a read and its corresponding write straddle a membership
+change — hinted handoff and read-repair, not the quorum math itself, are
+what actually close that gap. Nothing to fix in Phase 2; this is exactly
+the shape of thing Phase 4 (vector clocks) and Phase 6 (read-repair) exist
+to handle, and it's worth meeting this insight now rather than as a
+surprise once those phases are in front of it.
+
+**Left explicitly open, not blocking Phase 2 code — see `OPEN_QUESTIONS.md`
+Q15/Q16:** whether a live node that's learned (per the Phase 1 correction
+above) that its own status is `REMOVED` should stop selecting outbound
+gossip targets, whether inbound `GossipExchange` should also decline to
+merge once self-status is `REMOVED`, and whether a `REMOVED` node should
+decline to coordinate once Phase 3 exists.
+
+### GTStore comparisons made this session
+- **Preference-list computation from one authoritative center vs. computed
+  independently by every node.** GTStore's `GetNodeForKey` is one function
+  call against one `num_buckets` value in one process — every client gets
+  the same answer, always, because only one place is capable of computing
+  an answer. Driftstore has no such place: every node derives its own
+  preference list from its own local, eventually-converging ring. The
+  multi-coordinator divergence case above is a failure class GTStore cannot
+  produce at all, structurally, not just in practice.
+- **Random+persisted tokens (Dynamo's own original approach) vs.
+  deterministic derivation.** Dynamo needs disk persistence for its
+  node→token mapping because a Dynamo node has no cheap, stable identity to
+  lean on. Driftstore already solved that problem differently, in Phase 0,
+  by making `node_id_` the listen address specifically for restart
+  stability — deterministic tokens extend that existing simplification
+  rather than reaching for a second mechanism to solve the same underlying
+  problem. GTStore never faces this question at all: `bucket_id = hash(key)
+  % num_buckets` isn't a node identity, it's a position that only exists
+  relative to `num_buckets` at that instant, recomputed by the manager
+  whenever `N` changes — nothing about it needs to survive a restart,
+  because nothing about it is owned by any single node to begin with.
 
 ## How to update this file
 When a phase wraps: flip its status in the table, add a summary block (what

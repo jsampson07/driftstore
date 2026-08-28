@@ -66,7 +66,7 @@ int main(int argc, char** argv) {
         driftstore::RemoveResponse response;
         grpc::ClientContext context;
         context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(2));
-        logEvent(EventType::REMOVE_INIT, remove_target)
+        logEvent(EventType::REMOVE_INIT, remove_target);
         grpc::Status status = stub->RemoveNode(&context, request, &response);
 
         if (status.ok()) {

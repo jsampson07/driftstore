@@ -42,22 +42,6 @@ actual source.
 but worth confirming it isn't passing by accident (e.g. a stale process from
 an earlier run happening to still be up).
 
-### Q4 — Phase 2's preference-list computation has nothing to filter on yet
-`driftstore-phase1-design-decisions.md` defers local per-peer reachability
-tracking from Phase 1 to Phase 3 (no data path exists yet to generate a
-signal to watch). But the project plan's Phase 2 description says
-preference-list computation skips nodes "the coordinator's own local view
-currently considers unreachable — this is where Phase 1's reachability
-tracking actually gets used." If reachability tracking now lands in Phase 3,
-Phase 2 has no filter signal to consume when it's built. Options: Phase 2
-builds preference lists that treat every `UP` member as reachable, and
-Phase 3 wires in the actual filter once reachability tracking exists; or
-some smaller piece of reachability tracking gets pulled forward. Raised
-during Phase 1 proto/schema work.
-
-*Status:* unresolved — explicitly deferred by request ("don't want to decide
-now, don't want to lose momentum"). Revisit before Phase 2 design starts.
-
 ### Q7 — Is `node_id == listen address` permanent, or will they ever need to diverge?
 Currently `node_id_` *is* the `--listen` address string (locked in Phase 0, for stable
 identity across restarts — see `PROGRESS.md`), and the own-entry constructor now sets
@@ -145,6 +129,48 @@ to have, even if it wouldn't be called a "manager." Cassandra's own
 used as rough precedent for the static-list decision.
 
 *Context:* raised during Phase 1 `bootstrapFromSeed` retry/backoff design.
+
+### Q15 — Should a live node that's learned its own status is `REMOVED` stop participating in gossip?
+Surfaced during Phase 2 design while tracing what actually happens to a node
+that's administratively removed but never killed: its own local table entry
+for itself genuinely flips to `REMOVED` via ordinary gossip merge — see
+`PROGRESS.md`'s Phase 1 correction, added this same session. Nothing
+currently acts on that. Two separable sub-questions: (1) should
+`gossipRound` check self-status before calling `selectGossipTarget`,
+refusing to *initiate* further gossip once self-status is `REMOVED`; (2)
+should the inbound `GossipExchange` handler *also* decline to respond or
+merge once self-status is `REMOVED`, or is answering peers harmless since
+nothing downstream depends on it.
+
+*Status:* unresolved, not blocking Phase 2 — no data path currently depends
+on the answer. Leaning yes on (1), gated inside `gossipRound` itself rather
+than inside `selectGossipTarget` — folding it into target selection would
+mean a `nullopt` return conflates "no `UP` peers exist" with "chose not to
+look," both currently logged as `GOSSIP_NO_PEERS`; a genuinely no-peers
+situation and a deliberate self-removed silence should probably be
+distinguishable in the logs (e.g. a new `GOSSIP_SELF_REMOVED` event) rather
+than collapsed into one that already means something else. Leaning no on
+(2) — a node can't prevent peers from dialing it regardless of what it does
+internally, and refusing to answer or merge doesn't buy anything it doesn't
+already not-get from going silent as an initiator. Neither lean is locked.
+Worth deciding before Phase 8's kill/restart fault injection, where a
+remove-without-kill scenario producing a quietly-still-gossiping "removed"
+node is exactly the kind of thing that'd be confusing to debug fresh if
+it's still undecided by then.
+
+*Context:* raised during Phase 2 design conversation, after confirming
+empirically that a live-but-removed node's own view of itself does flip to
+`REMOVED`.
+
+### Q16 — Once Phase 3 exists, should a `REMOVED` node decline to coordinate or hold data?
+Related to Q15 but a separate layer: even if a `REMOVED` node keeps
+gossiping normally, should it also refuse to act as a coordinator or serve
+as a replica for a key, once it's aware of its own removed status? No
+coordinator exists yet, so nothing currently depends on the answer either
+way.
+
+*Status:* unresolved, explicitly deferred to Phase 3 design.
+*Context:* raised alongside Q15, Phase 2 design conversation.
 
 ---
 
@@ -335,3 +361,31 @@ measure the actual process's exit code.)
 *Context:* raised during `bootstrapFromSeed` retry/backoff design, this
 chat.
 *Resolved during:* same thread, via the dead-seed-list empirical test.
+
+### Q4 — Phase 2's preference-list computation has nothing to filter on yet
+`driftstore-phase1-design-decisions.md` defers local per-peer reachability
+tracking from Phase 1 to Phase 3 (no data path exists yet to generate a
+signal to watch). But the project plan's Phase 2 description says
+preference-list computation skips nodes "the coordinator's own local view
+currently considers unreachable — this is where Phase 1's reachability
+tracking actually gets used." If reachability tracking now lands in Phase 3,
+Phase 2 has no filter signal to consume when it's built. Options: Phase 2
+builds preference lists that treat every `UP` member as reachable, and
+Phase 3 wires in the actual filter once reachability tracking exists; or
+some smaller piece of reachability tracking gets pulled forward. Raised
+during Phase 1 proto/schema work.
+
+**Resolution:** Option A — Phase 2 treats every `UP` member as reachable;
+preference-list computation this phase is pure ring math (walk clockwise,
+collect N distinct physical nodes, skip only `REMOVED`). Phase 3 wires in
+the actual reachability filter as a second, additive condition on the same
+function once local reachability tracking exists to consume. Chosen over
+pulling a minimal reachability signal forward into Phase 2, specifically to
+keep the two mechanisms — gossiped membership and local, non-gossiped
+reachability — decoupled in code the same way they're already decoupled
+conceptually elsewhere in this project's plan, rather than re-coupling them
+under Phase 2's time-box for the sake of a demo scenario ("coordinator
+routes around a hung peer") that isn't due until Phase 3 regardless.
+
+*Context:* raised during Phase 1 proto/schema work.
+*Resolved during:* Phase 2 design conversation.

@@ -48,7 +48,7 @@ triggers each one._
 
 | Timestamp | Node ID | Event |
 
-## Membership & failure detection
+## Phase 1: Membership & failure detection
 
 **What fields actually live in a table entry?**
 Every node has a membership table. In it is a mapping from <node_id, {information of the peer}> for every node in the system. For example:
@@ -164,8 +164,56 @@ Because we are not guaranteed that `table_` remains the same during the gossip r
 
 *Always merge, NEVER overwrite*.
 
-## Consistent hashing / ring
-_Fill in once Phase 2 is designed._
+## Phase 2: Consistent hashing / ring
+
+Phase 2 treats all `UP` as reachable. Real filtering will be deferred to Phase 3.
+
+**How are tokens determined/assigned?**
+
+Tokens are deterministic via hash(node_id_ + ":" + i) for i in range [0, V]
+  - NOTE: V is the number of tokens for a node
+With this, no persistence is needed, because if a node dies and gets rebooted, its tokens (ring positions) would be the exact same
+
+On the contrary, if we have tokens randomly assigned, then if a node were to reboot, it would be assigned completely different tokens, meaning it now owns a completely different subset of keys than originally. To prevent this, we would need some sort of log or disk-persistence layer so when a node is rebooted, it can just grab its recorded positions from there. (PERSISTENCE LAYER NEEDED)
+
+**What hash function will we use?**
+
+FNV-1a, 64-bit
+There is no stdlib dependency, will produce the same hashes for same input across various runs.
+
+**What data structure will support our ring? What are the different options?**
+
+Our ring will be a std::map<uint64_t, node_id>: key=token (pos on ring), value=primary node owner.
+
+Will behave like table_ where there is one instance across the lifepsan of a node. It is continuously added to as membership/gossiping facilitates OR removed from (ONLY when a node is marked as REMOVED).
+
+The other option would be to derive the ring on demand. Everytime a key is queried, the rin would be derived based off of the current instance of table_ and its recorded tokens for each of the nodes. Then sort and construct 'preference list'.
+
+**Where is the ring updated?**
+
+- Three conditions inside of mergeInto:
+  1) insert on new-and-UP
+  2) insert on REMOVE->UP
+  3) remove on UP->REMOVE
+- When a node is removed (RemoveNode) --> for the node receives the `REMOVE` request
+- When a node is initialized (constructor)
+  ==> THIS IS IMPORTANT B/C: if node doesn't add itself to the ring, then its own node entry lives in the table, and when other nodes gossip with the node, new entries ONLY are added to the ring, but it already has its own node_id as an entry, so it treats it as "already added to the ring". Any new entries have their tokens added to the ring. The node's own tokens are NEVER added no matter how much gossiping is done.
+
+**Preference-list walk**
+
+1) call upper_bound(hash(key))
+  - finds first entry larger than hash(key)
+2) iterate forward (index 0 -> len - 1)
+3) dedupe by physical node (using unordered_set to see if physical is unique or NOT)
+4) iterate until N unique physical nodes OR after one full pass (meaning not enough unique N nodes)
+  - if fewer than N distinct nodes --> return early for now
+
+**Not yet written here — worth being able to say without notes before Phase 3:**
+_Why can two different nodes, coordinating the same key at nearly the same moment,
+legitimately compute two different preference lists? What has to be true about
+membership for that to happen, and why is it not a bug? Separately: is the
+preference list itself different for a read versus a write on the same key — and
+if not, what actually is different between how a read and a write use it?_
 
 ## Client API
 _Fill in once Phase 3 is designed._

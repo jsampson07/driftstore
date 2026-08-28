@@ -52,7 +52,7 @@ int main(int argc, char** argv) {
         grpc::Status status = stub->GetStatus(&context, request, &response);
 
         if (status.ok()) {
-            std::printf("node=%s %s\n", response.node_id().c_str(), response.table_dump().c_str());
+            std::printf("node=%s %s\n%s\n", response.node_id().c_str(), response.table_dump().c_str(), response.ring_dump().c_str());
             return 0;
         }
         std::fprintf(stderr, "status query failed: target=%s error=%s\n",

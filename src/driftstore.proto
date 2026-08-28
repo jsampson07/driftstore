@@ -49,6 +49,7 @@ message StatusRequest {}
 message StatusResponse {
     string node_id = 1;
     string table_dump = 2;
+    string ring_dump = 3;
 }
 
 message RemoveRequest {

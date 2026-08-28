@@ -45,6 +45,22 @@ namespace {
         out += "]";
         return out;
     }
+
+    /**
+    FINISH COMPLETING THIS FOR RING DUMP
+    */
+    std::string dumpRing(const std::map<uint64_t, std::string>& ring) {
+        std::string out = "ring_size=" + std::to_string(ring.size()) + " tokens=[";
+        size_t i = 0;
+        for (const auto& [token, node_id] : ring) {
+            out += std::to_string(token) + ":" + node_id; // <token>:<node_id_owner_of_token>
+            if (++i < ring.size()) {
+                out += ",";
+            }
+        }
+        out += "]";
+        return out;
+    }
     
 }  // namespace
 
@@ -95,13 +111,17 @@ public:
     grpc::Status GetStatus(grpc::ServerContext* /*context*/,
                            const driftstore::StatusRequest* /*request*/,
                            driftstore::StatusResponse* response) override {
-        driftstore::MembershipTable snapshot;
+        driftstore::MembershipTable table_snapshot;
+        std::map<uint64_t, std::string> ring_snapshot;
         {
             std::lock_guard<std::mutex> lock(table_mutex_);
-            snapshot = table_;
+            table_snapshot = table_;
+            ring_snapshot = ring_;
+
         }
         response->set_node_id(node_id_);
-        response->set_table_dump(dumpTable(snapshot));
+        response->set_table_dump(dumpTable(table_snapshot));
+        response->set_ring_dump(dumpRing(ring_snapshot));
         return grpc::Status::OK;
     }
 

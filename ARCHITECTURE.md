@@ -209,14 +209,121 @@ The other option would be to derive the ring on demand. Everytime a key is queri
   - if fewer than N distinct nodes --> return early for now
 
 **Not yet written here — worth being able to say without notes before Phase 3:**
-_Why can two different nodes, coordinating the same key at nearly the same moment,
-legitimately compute two different preference lists? What has to be true about
-membership for that to happen, and why is it not a bug? Separately: is the
-preference list itself different for a read versus a write on the same key — and
-if not, what actually is different between how a read and a write use it?_
+*Why can two different nodes, coordinating the same key at nearly the same moment, legitimately compute two different preference lists? What has to be true about membership for that to happen, and why is it not a bug?*
+
+Two different nodes, coordinating the same key at nearly the same moment, can compute two different preference lists if there is a membership change that
+hasn't yet been gossiped to both coordinators, rather only to one of the two. This leads to one of the node's ring reflecting the changes, where the other
+doesn't reflect any change.
+
+This is NOT a bug because they both stay true to their ring's state. There is NO single authoritative ring in the system, each node's ring is relative to its own local
+information, with gossips for updates.
+
+*Separately: is the preference list itself different for a read versus a write on the same key — and if not, what actually is different between how a read and a write use it?*
+
+The preference list itself is NOT different for a read versus a write on the same key because there is no branch when computing *preference_list* for a read versus write. The same
+deterministic function is applied for both.
+
+A read uses the *preference_list* by reading from R of the N nodes, where each can return different versions of the same key. Then it has to decide which version
+to hand back to the client. A write uses the *preference_list* by having successful writes to W of the N nodes. If < W writes succeed, then the write is considered failed.
 
 ## Client API
-_Fill in once Phase 3 is designed._
+
+**How to determine a node's reachability?**
+1) dedicated probe (like GTStore Ping) - O(N)
+2) apart of gossipRound() - nodes picked randomly, as cluster size grows, degrades to update every N*RPC seconds
+3) feed from both gossip outcomes and Get/Put RPCs - busy peers get fresher readings on "reachability" than idle ones
+  --> this is an acceptable tradeoff, since "hot" nodes or nodes that are most likely routed to are the ones that need the most organic signal
+
+  **NEW ADDITION:** Use Ping RPC that already exists to ONLY ping "unreachable" nodes so that it is doing useful work. This is better
+  than pinging "reachable + unreachable" nodes as this leads to wasted RPCs and unnecessary network congestion for reachable nodes.
+  In a healthy system, the "unreachable" nodes set should be empty.
+
+**What are the tradeoffs with *dedicated probe*?**
+
+Dedicated probe means we have O(N) probing, which means it grows as cluster size grows. The larger the cluster, the slower the probing becomes.
+
+**What are the tradeoffs with *gossipRound()* only?**
+
+Gossip protocol randomly selects a node to gossip with, which could mean a node doesn't get gossiped at all for some time, OR, in the best case, a node gets
+gossiped with 1 out of N times. This means each entry will most likely be stale and untrue to the current state of the node. Also declines as cluster size
+grows.
+
+**What are the tradeoffs with *gossip* and *Get/Put RPC updates*? (THIS IS THE DESIGN I AM CHOOSING)**
+
+More bookkeeping and places to manage reachability, but gets recency (of reachability - through two routes) as well as minimal RPC/network requests.
+
+**Implement any form of timestamps of versioning or no, and why?**
+
+No form of versioning, this is for later phase, For now just take the first node (in the order of preference_list) that responded with a value.
+
+**Asynchronous or synchronous writes to replicas?**
+
+Asynchronous writes is bounded by slowest node, whereas synchronous writes latency becomes sum of their response times (sum(RTs)).
+Also want to write to >= W nodes, with room for a few nodes failing early. In GTStore, b/c consistency > availability, after one
+node fails, write is considered failed and should behave in such a way so synchronous is slightly more sensible, because asynchronous
+on a failed write, would still send off N-1 other RPCs.
+
+**What data structure used to maintain reachability locally (for each node) and what locking mechanism might we use?**
+
+std::unordered_map<std::string, bool> = <node_id, true/false> where T/F if reachable or not
+Use separate lock for reachability because this is unrelated to membership. This is a completely different
+concept that is has no "convergent" value, just dependent on each individual node.
+
+**New stateful library:**
+
+connect(seed_noes) with seed fallback which keeps the client alive
+
+**What does reachability actually store per peer/node?**
+
+Reachability stores a boolean for each peer (true = reachable, false = unreachable).
+
+**What triggers this boolean to flip?**
+
+Few options:
+1) LastN-like behavior (symmetric, N consecutive failures)
+
+For a node to be marked "unreachable", there need to be N consecutive failures. But if a node is stuck or backed up, and can't service requests for the next
+say M requests, and M > N, then there are going to be a wasted N-1 calls to the "unreachable" node before it is officially marked as unreachable.
+This leads to wasted RPC calls.
+
+2) LastN-like behavior (asymmetric thresholds, trip on 1 failure, require K successes to recover)
+
+Recover latency suffers. For a node that was slow just one time, it requires K successes before being flipped back to "reachable".
+
+3) Most recent outcome
+
+The moment a node fails to respond to a request, marked as "unreachable". Then, the moment its next contact suceeds, marked as "reachable".
+Stays true to current known state of the node. Assisted by quorum-based reads and writes because the success of a read/write is not affected by a single node failing.
+There is room for node failures/slow networks during a request that deems a request as "failed" because it only looks for W/R successes.
+Marking "unreachable" immediately does NOT affect the correctness of the system and we maintain data availability by using quorums. If we had a single-fail behaving system,
+then perhaps we would want N consecutive failures (and a retry on that before marking a node as "unreachable").
+
+**How to run loop for unreachable nodes?**
+
+1) Polling:
+Background thread --> runs reachability check "unreachable" nodes every "polling-interval" (provided as command-line field)
+Means needs to snapshot "unreachable" set
+  - But this is very cheap operation, considering in a healthy system, this set will be small if not empty
+Check if empty or not
+  - if empty: sleep (no work, no CPU resources, no spinning)
+  - else: Ping each unreachable node
+
+2) Condition-variable-gated
+Prevents "reachability" loop from running when set is known to be empty.
+Signal when a new node is marked as "unreachable" which wakes up the sleeping thread to execute until "unreachable" set is empty again.
+HOWEVER:
+Introduces a new bug class that isn't necessary, why?
+The work done by the polling implementation, is basically doing an O(1) check (when unreachable set is empty) and the thread still sleeps in between polls.
+If misshandle a spurious wakeup or forget to call `notify_one()`, then bug introduced.
+
+**Introducing reachability introduces new path for `preference_list.size() < N`. What is this new path, how does this happen, and what to do about it?**
+
+New path: if there are > N nodes but enough are 'unreachable' so < N nodes are added to pref list.
+
+Before path: the ring did not have N distinct UP physical nodes in cluster (no concept of reachability).
+
+Treat both situations the same: `preference_list.size() < N`. Whether its because there are less than N physical nodes
+versus less than N reachable nodes should lead to the same outcome. Failed write/read.
 
 ## Vector clocks & conflict resolution
 _Fill in once Phase 4 is designed._

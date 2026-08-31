@@ -15,6 +15,8 @@
 #include <sstream>
 #include <map>
 #include <unordered_set>
+#include <unordered_map>
+#include <future>
 
 namespace {
 
@@ -46,9 +48,6 @@ namespace {
         return out;
     }
 
-    /**
-    FINISH COMPLETING THIS FOR RING DUMP
-    */
     std::string dumpRing(const std::map<uint64_t, std::string>& ring) {
         std::string out = "ring_size=" + std::to_string(ring.size()) + " tokens=[";
         size_t i = 0;
@@ -155,6 +154,58 @@ public:
         return grpc::Status::OK;
     }
 
+    /**
+    Nothing stops a request from being routed to a "REMOVED" node.
+    If no check, if self is removed, would happily service the request.
+    But also, if node is removed, but coordinator has no knowledge yet (not yet gossiped with)
+    then also want to check because cannot assume route to UP nodes only.*/
+    bool isSelfRemoved() {
+        std::lock_guard<std::mutex> lock(table_mutex_);
+        return table_.entries().at(node_id_).status() == driftstore::REMOVED; // constructor guarantees a self-entry always exists so use at() instead of find() in case this invariant is broken
+    }
+
+    grpc::Status ReplicateWrite(grpc::ServerContext* /*context*/,
+                                const driftstore::ReplicateWriteRequest* request,
+                                driftstore::ReplicateWriteResponse* response) override {
+        if (isSelfRemoved()) {
+            response->set_success(false);
+            return grpc::Status::OK;
+        }
+        localPut(request->key(), request->value());
+        response->set_success(true);
+        return grpc::Status::OK;
+    }
+
+    grpc::Status ReplicateRead(grpc::ServerContext* /*context*/,
+                               const driftstore::ReplicateReadRequest* request,
+                               driftstore::ReplicateReadResponse* response) override {
+        if (isSelfRemoved()) {
+            response->set_found(false);
+            return grpc::Status::OK;
+        }
+        std::optional<std::string> value = localGet(request->key());
+        response->set_found(value.has_value());
+        if (value) {
+            response->set_value(*value);
+        }
+        return grpc::Status::OK;
+    }
+
+    std::unordered_set<std::string> unreachableSnapshot() {
+        std::lock_guard<std::mutex> lock(unreachable_peers_mutex_);
+        return unreachable_peers_;
+    }
+
+    void markUnreachable(const std::string& peer_id) {
+        std::lock_guard<std::mutex> lock(unreachable_peers_mutex_);
+        unreachable_peers_.insert(peer_id);
+    }
+
+    void markReachable(const std::string& peer_id) {
+        std::lock_guard<std::mutex> lock(unreachable_peers_mutex_);
+        unreachable_peers_.erase(peer_id);
+    }
+
     // Call once from main(), after BuildAndStart() — mirrors bootstrapFromSeed's
     // placement: the node must be reachable as a server before it starts acting
     // as an autonomous client. Spawns the loop and detaches it.
@@ -164,9 +215,12 @@ public:
     // a stop mechanism before it's safe. Otherwise if instance containing start()
     // is destroyed while exec'ing gossipLoop(), then we get undefined behavior.
     // Must have entire process killed immediately (SIGKILL).
-    void start(int64_t gossip_interval_ms) {
+    void start(int64_t gossip_interval_ms, int64_t reachability_interval_ms) {
         std::thread([this, gossip_interval_ms]() {
             gossipLoop(gossip_interval_ms);
+        }).detach();
+        std::thread([this, reachability_interval_ms]() {
+            reachabilityLoop(reachability_interval_ms);
         }).detach();
     }
 
@@ -227,8 +281,12 @@ public:
     }
 
     std::vector<std::string> preferenceListForKey(const std::string& key, int N) {
+        std::unordered_set<std::string> unreachable_peers = unreachableSnapshot();
+        auto predicate = [unreachable_peers = std::move(unreachable_peers)](const std::string& node_id) {
+            return unreachable_peers.find(node_id) == unreachable_peers.end();  // true = reachable = passes
+        };
         std::lock_guard<std::mutex> lock(table_mutex_);
-        return preferenceList(ring_, mix64(fnv1a64(key)), N);
+        return preferenceList(ring_, mix64(fnv1a64(key)), N, predicate);
     }
     
     bool bootstrapFromSeed(const std::vector<std::string>& seeds) {
@@ -265,11 +323,60 @@ private:
     driftstore::MembershipTable table_;
     std::mutex table_mutex_;
     std::map<uint64_t, std::string> ring_;
+    std::unordered_set<std::string> unreachable_peers_;
+    std::mutex unreachable_peers_mutex_;
+    std::unordered_map<std::string, std::string> kv_store_;
+    std::mutex kv_store_mutex_;
+
+    bool pingPeer(const std::string& peer_addr) {
+        auto channel = grpc::CreateChannel(peer_addr, grpc::InsecureChannelCredentials());
+        std::unique_ptr<driftstore::DriftStoreNode::Stub> stub =
+            driftstore::DriftStoreNode::NewStub(channel);
+
+        driftstore::PingRequest request;
+        request.set_sender_node_id(node_id_);
+        driftstore::PingResponse response;
+        grpc::ClientContext context;
+        context.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(500));
+
+        logEvent(EventType::PROBE_SENT, node_id_, "target=" + peer_addr);
+        grpc::Status status = stub->Ping(&context, request, &response);
+
+        if (status.ok()) {
+            logEvent(EventType::PROBE_SUCCEEDED, node_id_, "target=" + peer_addr);
+            return true;
+        }
+        logEvent(EventType::PROBE_FAILED, node_id_, "target=" + peer_addr);
+        return false;
+    }
+
+    void localPut(const std::string& key, const std::string& value) {
+        std::lock_guard<std::mutex> lock(kv_store_mutex_);
+        kv_store_[key] = value;
+    }
+
+    std::optional<std::string> localGet(const std::string& key) {
+        std::lock_guard<std::mutex> lock(kv_store_mutex_);
+        auto it = kv_store_.find(key);
+        if (it != kv_store_.end()) {
+            return it->second;
+        }
+        return std::nullopt;
+    }
 
     void gossipLoop(int64_t gossip_interval_ms) {
         while (true) {
             gossipRound(); // Gossip with peer
             std::this_thread::sleep_for(std::chrono::milliseconds(gossip_interval_ms)); // Sleep for default = 1, or provided
+        }
+    }
+
+    void reachabilityLoop(int64_t reachability_interval_ms) {
+        while (true) {
+            while (!unreachable_peers_.empty()) {
+                reachabilityRound();
+                std::this_thread::sleep_for(std::chrono::milliseconds(reachability_interval_ms));
+            }
         }
     }
 
@@ -298,6 +405,26 @@ private:
             driftstore::MembershipTable merged = applyGossip(response->table()); // This new node will now update its membership table to what merged table returned by seed
             logEvent(EventType::GOSSIP_MERGED, node_id_,
                 "source=round peer=" + *peerAddr);
+        }
+    }
+
+    void reachabilityRound() {
+        std::unordered_set<std::string> snapshot = unreachableSnapshot();
+        if (snapshot.empty()) {
+            return;
+        }
+        std::vector<std::string> peers(snapshot.begin(), snapshot.end());
+        std::vector<std::future<bool>> futures;
+        futures.reserve(peers.size());
+        for (const std::string& peer : peers) {
+            futures.push_back(std::async(std::launch::async, [this, peer]() {
+                return pingPeer(peer);
+            }));
+        }
+        for (size_t i = 0; i < peers.size(); ++i) {
+            if (futures[i].get()) {
+                markReachable(peers[i]);
+            }
         }
     }
 
@@ -339,12 +466,14 @@ int main(int argc, char** argv) {
     std::string listen;
     std::string seed_arg;  // possibly comma-separated
     std::string gossip_interval_ms = "1000";
+    std::string reachability_interval_ms = "3000";
     std::string vnodes_str = "32";
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         static constexpr char kListenPrefix[] = "--listen=";
         static constexpr char kSeedPrefix[] = "--seed=";
         static constexpr char kGossipIntervalPrefix[] = "--gossip-interval=";
+        static constexpr char kReachabilityIntervalPrefix[] = "--probe-interval=";
         static constexpr char kVnodesPrefix[] = "--vnodes=";
         if (arg.rfind(kListenPrefix, 0) == 0) {
             listen = arg.substr(sizeof(kListenPrefix) - 1);
@@ -352,6 +481,8 @@ int main(int argc, char** argv) {
             seed_arg = arg.substr(sizeof(kSeedPrefix) - 1);
         } else if (arg.rfind(kGossipIntervalPrefix, 0) == 0) {
             gossip_interval_ms = arg.substr(sizeof(kGossipIntervalPrefix) - 1);
+        } else if (arg.rfind(kReachabilityIntervalPrefix, 0) == 0) {
+            reachability_interval_ms = arg.substr(sizeof(kReachabilityIntervalPrefix) - 1);
         } else if (arg.rfind(kVnodesPrefix, 0) == 0) {
             vnodes_str = arg.substr(sizeof(kVnodesPrefix) - 1);
         }
@@ -387,7 +518,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    service.start(std::stoll(gossip_interval_ms));
+    service.start(std::stoll(gossip_interval_ms), std::stoll(reachability_interval_ms));
 
     server->Wait();
     return 0;

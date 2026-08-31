@@ -23,6 +23,9 @@ enum class EventType {
     REMOVE_FAILED,
     REMOVE_SUCCEEDED,
     NODE_REBOOTED,
+    PROBE_SENT,
+    PROBE_SUCCEEDED,
+    PROBE_FAILED,
 };
 
 inline const char* toString(EventType e) {
@@ -45,6 +48,9 @@ inline const char* toString(EventType e) {
         case EventType::REMOVE_FAILED: return "REMOVE_FAILED";
         case EventType::REMOVE_SUCCEEDED: return "REMOVE_SUCCEEDED";
         case EventType::NODE_REBOOTED: return "NODE_REBOOTED";
+        case EventType::PROBE_SENT: return "PROBE_SENT";
+        case EventType::PROBE_SUCCEEDED: return "PROBE_SUCCEEDED";
+        case EventType::PROBE_FAILED: return "PROBE_FAILED";
     }
 }
 

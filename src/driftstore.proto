@@ -24,6 +24,48 @@ service DriftStoreNode {
     rpc GossipExchange(GossipRequest) returns (GossipResponse);
     rpc GetStatus(StatusRequest) returns (StatusResponse);
     rpc RemoveNode(RemoveRequest) returns (RemoveResponse);
+    rpc Put(PutRequest) returns (PutResponse);
+    rpc Get(GetRequest) returns (GetResponse);
+    rpc ReplicateWrite(ReplicateWriteRequest) returns (ReplicateWriteResponse);
+    rpc ReplicateRead(ReplicateReadRequest) returns (ReplicateReadResponse);
+}
+
+message PutRequest {
+    string key = 1;
+    string value = 2;
+}
+
+message PutResponse {
+    bool success = 1; // this is only on if acks >= W
+    int32 acks = 2; // how many replicas succeeded ( >= W )
+}
+
+message GetRequest {
+    string key = 1;
+}
+
+message GetResponse {
+    bool found = 1;
+    string value = 2;
+    int32 responses = 3; // number of replicas answered ( >= R )
+}
+
+message ReplicateWriteRequest {
+    string key = 1;
+    string value = 2;
+}
+
+message ReplicateWriteResponse {
+    bool success = 1;
+}
+
+message ReplicateReadRequest {
+    string key = 1;
+}
+
+message ReplicateReadResponse {
+    bool found = 1;
+    string value = 2;
 }
 
 message PingRequest {
@@ -59,3 +101,4 @@ message RemoveRequest {
 message RemoveResponse {
     bool accepted = 1; // false if target_node_id is NOT in the table
 }
+

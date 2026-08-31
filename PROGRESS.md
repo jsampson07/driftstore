@@ -11,8 +11,8 @@
 |---|---|---|
 | 0 | Scaffolding + comparison harness skeleton | ✅ Done |
 | 1 | Gossip membership + local failure detection | ✅ Done |
-| 2 | Consistent hashing ring + virtual nodes | 🔄 In progress |
-| 3 | Any-node coordinator + basic quorum read/write | ⬜ Not started |
+| 2 | Consistent hashing ring + virtual nodes | ✅ Done |
+| 3 | Any-node coordinator + basic quorum read/write | 🔄 In progress |
 | 4 | Vector clocks + conflict detection | ⬜ Not started |
 | 5 | Hinted handoff | ⬜ Not started |
 | 6 | Read-repair | ⬜ Not started |
@@ -927,6 +927,457 @@ Both tracked as Q17 in `OPEN_QUESTIONS.md`.
   recompute from; Driftstore pays a small continuous cost (imbalance) to
   avoid paying a large discrete one (mass reassignment) whenever membership
   moves.
+
+### Update — ring observability + live join-scenario verification (later session)
+
+Closed the specific gap Q17 flagged as the reason two ring-mutation points
+couldn't be tested: no live multi-node test had ever touched Phase 2 code,
+and there was no RPC/CLI surface exposing `ring_` externally. Took option
+(c) from Q17's list.
+
+**`dumpRing()`** implemented in `node.cpp`, added to the existing
+`GetStatus` response (`ring_dump` field) rather than a new RPC — table and
+ring are two views of state already mutated under the same
+`table_mutex_`, so one round trip getting both was preferred over a second
+endpoint. No explicit sort needed, unlike `dumpTable`: `ring_` is a real
+`std::map<uint64_t, std::string>`, already ordered by construction, unlike
+protobuf's `map<string, MembershipEntry>`, which gives no iteration-order
+guarantee. `client.cpp --status` was separately found to only print
+`table_dump`, never the new `ring_dump` field — fixed alongside.
+
+**Live join-scenario run:** 2-node cluster (A, B), snapshot `ring_dump` via
+`GetStatus`, join a 3rd node C via `--seed`, snapshot again, diff.
+Before: `table_size=2`, `ring_size=64`. After: `table_size=3`,
+`ring_size=96`. Diff: 32 added lines, 0 removed, 0 changed — pure
+additions only. Confirms Phase 2's stated production scenario ("a new node
+joins... only virtual-node ranges adjacent to its tokens move") directly:
+since `ring_[token] = node_id` is only ever set once per token or erased,
+never rewritten, a zero-modified-lines diff is a direct proof that no
+existing key's `preferenceList()` result changed — not an inference from
+the ring math, an empirical confirmation of it.
+
+**Does not fully close Q17.** The live-observability blocker is gone, but
+neither of Q17's two original coverage gaps (`RemoveNode`'s direct
+erasure, the `UP→UP` refresh path) got a test out of this run — the join
+scenario exercises insertion, not removal. Both remain open, now with
+working tooling available to close them if that's worth doing later. See
+`OPEN_QUESTIONS.md` Q17 for the precise update.
+
+**GTStore comparison:** GTStore's `GetNodeForKey` is `hash(key) %
+num_buckets` — bumping `num_buckets` changes the modulus for every key at
+once, so there's no such thing as a "pure addition" diff for a join over
+there; it's a global reshuffle by construction. The diff above is the
+empirical version of that already-documented tradeoff, not a new one.
+
+---
+
+## Phase 3 — Any-node coordinator + basic quorum read/write (design locked, implementation starting)
+
+Full design worked out in conversation before any code was written, same
+rule as Phase 2. Nothing below is implemented yet.
+
+**Proto additions:** `Put`/`Get` (client-facing) and `ReplicateWrite`/
+`ReplicateRead` (coordinator-to-replica, internal) as four distinct RPCs
+rather than reusing `Put`/`Get` for both roles — chosen specifically so a
+replica's log can tell "a client asked me directly" apart from "a
+coordinator asked me on a client's behalf" without inspecting request
+internals, which matters given this project's correlated-log debugging
+approach. Value fields are `string`, not `bytes`. No timestamp/version
+field anywhere yet — deliberately deferred to Phase 4, so as not to
+quietly pre-commit to LWW before that phase's real decision between LWW
+and sibling versions. `N`/`W`/`R` are node-level CLI flags (same pattern
+as `--vnodes`), not per-request parameters.
+
+**`N`/`W`/`R` validation — resolved, strict.** `main()` will enforce
+`N, W, R >= 1`, `W <= N`, `R <= N`, and `W + R > N` at startup, refusing
+to start (same `return 1` usage-error path as `listen.empty()`) rather
+than accepting a configuration that can never satisfy quorum. Chosen
+over leaving these unvalidated the way `--gossip-interval` currently is
+(Q9) specifically because the failure modes aren't comparable: a bad
+interval value degrades gracefully or crashes obviously and immediately,
+while a bad `N`/`W`/`R` combination (`W=0`, or `W+R <= N`) would
+silently produce wrong-looking quorum behavior later — a write reporting
+success with no real durability guarantee, or a read that can never
+detect a stale replica — which is much harder to notice than a startup
+crash. **Decided, not yet implemented** — `main()` doesn't parse
+`--N=`/`--W=`/`--R=` yet.
+
+**Coordinator role is not tied to preference-list membership.** Any node
+can coordinate any key's request, but it's only *in* that key's
+preference list when its own tokens happen to fall among the top-N — not
+by virtue of coordinating. When it is: it writes locally first (no
+self-RPC — an RPC-to-self can fail in loopback-specific ways a direct
+local write can't) and that local write counts toward `W`. `ReplicateWrite`
+fans out to the rest of the list, fired concurrently — sequential fan-out
+would make write latency the *sum* of replica response times instead of
+the *max*. `>= W` acks (local write included) marks the write successful.
+Read side is symmetric: `ReplicateRead` to `R` replicas, also concurrent.
+
+**Fan-out completion semantics — resolved: concurrent launch, wait for
+all, then count.** "Concurrent" answers *when the RPCs start*, not *when
+the coordinator stops waiting for them* — these are separate axes, worth
+having kept separate on purpose. Considered and rejected: returning to
+the caller the instant the `W`th (or `R`th) ack arrives, leaving the
+remaining launched RPCs running unattended. Rejected because it turns a
+bounded, easy-to-reason-about `std::async` + `.get()`-in-a-loop into a
+real thread-lifetime problem — a shared counter/condition-variable to
+wake the waiter early, plus a decision about whether a straggler's
+result, arriving into shared state after the request has already
+returned, needs that state to outlive the request — in exchange for a
+latency optimization nothing in this phase's scope actually asks for.
+Concurrent launch alone already gets the "latency is the max, not the
+sum" property the paragraph above cares about; waiting for every
+launched RPC to finish before checking the count is what keeps the
+fan-out-plus-quorum logic itself simple. The read side's "return the
+first response received" doesn't need early termination either: every
+launched `ReplicateRead` still runs to completion, each result gets
+stamped with an arrival-order sequence number as it lands, and "first"
+is read off that sequence after all of them are in — not raced for live.
+
+**`N` is not a pass/fail threshold — only `W`/`R` are, and only the
+coordinator ever checks them.** `preferenceListForKey` can legitimately
+return fewer than `N` candidates, either because fewer than `N` distinct
+physical nodes exist in the ring yet, or because `N`-or-more exist but
+some are currently unreachable — deliberately not distinguished (see the
+reachability section below); the coordinator doesn't need to know which
+cause produced a short list, only how short. Neither cause is itself a
+failure. The only question that matters, checked *before* any RPC goes
+out: is `preference_list.size() >= W` (write) / `>= R` (read)? If not,
+the request is already guaranteed to fail and the coordinator can refuse
+without dialing anyone. If so, the coordinator fans out to every
+candidate it has — which may itself be fewer than `N` — and only fails
+if the actual ack/response count comes up short of `W`/`R` afterward.
+This judgment lives entirely in the coordinator: `preferenceListForKey`
+and `ring.hpp`'s `preferenceList()` stay completely ignorant of `W`/`R`,
+and of pass/fail generally, consistent with `ring.hpp`'s existing
+single-purpose, side-effect-free design (pure ring math, testable on
+fabricated input alone). One consequence worth flagging for Phase 5:
+`preferenceList()` still caps at exactly `N` candidates — it does not
+walk further to stockpile standby nodes the way Dynamo's own preference
+list does specifically for hinted-handoff purposes (paper §4.3). That's
+deliberately out of scope until Phase 5 actually has hint bookkeeping to
+attach to a standby candidate; adding it now would be building half a
+mechanism with nothing to attach the other half to.
+
+**Read conflict policy — deliberately the naive floor, not LWW.** When
+`R` responses disagree, the coordinator returns the first response
+received and logs the disagreement. Discussed and rejected as a design
+option: returning the highest-`last_updated` response — that's not a
+simpler fallback, it *is* one of Phase 4's two real candidate policies
+(LWW) arrived at a phase early, and it assumes a timestamp field that
+doesn't exist yet on stored values. The actual naive floor has zero new
+state and zero comparison logic: whichever reply lands first, full stop.
+It's supposed to be bad — that badness is the argument for why Phase 4
+needs to exist at all.
+
+**Reachability tracking — private, non-gossiped, per-peer state; not a
+`NodeStatus` value.** Deliberately not added to `MembershipEntry`/
+gossiped: doing so would let one node's local, possibly-wrong belief
+about a peer propagate as if it were cluster-agreed fact, which is
+exactly the SWIM-style mechanism Section 2 already declined in favor of
+Dynamo's model. Lives as its own state in `NodeServiceImpl`
+(`std::unordered_set<std::string>` of currently-*unreachable* peer IDs —
+presence means unreachable, absence means reachable, which gets the
+locked optimistic default for a peer known only through gossip, never
+directly contacted — "unknown = reachable" — for free, with no
+special-casing), under its own mutex, separate from `table_mutex_` and
+the new KV store's lock.
+
+Marked unreachable on any failed `Put`/`Get`/`ReplicateWrite`/
+`ReplicateRead`/gossip outcome to that peer. Two paths back to reachable,
+and only two: (1) a successful gossip round to that peer —
+`selectGossipTarget` stays `UP`-only and must never start filtering on
+reachability, since once a peer is excluded from `preferenceList()`,
+gossip is the only remaining channel that still contacts it at all; (2)
+a new dedicated background probe thread, using the existing (previously
+unused) `Ping` RPC, on its own configurable interval, polling only the
+current unreachable set — same loop-then-sleep shape as `gossipLoop`,
+deliberately not condition-variable/notify-based (considered and
+rejected: solves a CPU cost — an O(1) empty-set check every few seconds —
+that doesn't meaningfully exist at this interval and scale, in exchange
+for a new synchronization primitive and a real new bug class, a missed
+`notify_one()` from any of five different marking call sites).
+
+**Hysteresis (last-N-outcomes) considered and rejected in favor of a bare
+bool, single-most-recent-outcome.** This matches both the project plan's
+own Phase 1 description ("clears as soon as a request to that peer
+succeeds again") and the Dynamo paper's own §4.8.3 description of local
+failure detection — neither describes anything with memory across
+multiple outcomes. Flapping is accepted, not engineered away: sloppy
+quorum (`W`/`R` < `N`) is specifically what already tolerates a
+wrong-for-one-cycle routing decision, so smoothing reachability at the
+source spends real complexity (and, for any threshold-to-recover > 1, real
+availability — a node's needless exclusion time) solving a problem the
+architecture already has slack for. This has zero correctness weight
+either way, since reachability never touches the gossiped membership
+table that actually governs correctness.
+
+**`preferenceList()`'s new parameter — a predicate, not raw reachability
+state.** Per Q4's resolution ("the actual reachability filter as a
+second, additive condition on the same function"), the ring walk gains a
+second skip condition alongside its existing physical-node dedupe: a
+`std::function<bool(const std::string&)>` reachability check, defaulted
+to always-`true`. Every existing caller — including `test_ring.cpp`'s
+synthetic-snapshot tests — keeps compiling and behaving identically
+unchanged. Chosen over passing the raw `unordered_set` directly,
+specifically to preserve `ring.hpp`'s existing property of being fully
+standalone and testable against fabricated inputs, with no dependency on
+`NodeServiceImpl`'s concrete types.
+
+**KV storage — new state, not yet touching anything else.**
+`std::unordered_map<std::string, std::string>`, bare value, own mutex —
+separate from `table_mutex_` and reachability's mutex specifically so
+`Put`/`Get`, gossip rounds, and reachability marking never serialize
+against each other for no reason. Three independent locks total in the
+system after this phase.
+
+**`REMOVED` node behavior — see `OPEN_QUESTIONS.md` Q15/Q16, now
+resolved.** Declines `Put`/`Get`/`ReplicateWrite`/`ReplicateRead`; keeps
+initiating and answering gossip, and keeps answering `GetStatus`/`Ping`.
+
+**Client — new stateful library, named `DriftClient`, not an extension
+of `client.cpp`.** `connect(seed_nodes)` takes a list with fallback across it, mirroring
+`bootstrapFromSeed`'s own shape, rather than a single fixed target. A
+single-target client would relocate GTStore's manager-SPOF problem onto
+"whichever one address happened to be passed on the command line" instead
+of eliminating it — the whole point of "any node can coordinate" doesn't
+reach the client side without this.
+
+### GTStore comparisons made this session
+- **Client bootstrap SPOF, revisited.** Already noted in Phase 0 that
+  Driftstore's `client.cpp` has no manager-dial step GTStore's `init()`
+  has. Building the real client library surfaced the sharper version:
+  a client that only ever knows *one* node address has just moved the
+  SPOF from "the manager" to "whichever node happened to be on the
+  command line" — `connect(seed_nodes)`'s fallback list is what actually
+  closes that gap, not the absence of a manager by itself.
+- **Read/write asymmetry has no GTStore analogue.** GTStore's write-all/
+  ack-all model means every replica has the same value by the time any
+  read can happen — there's no such thing as a read getting back
+  disagreeing versions in that model. Driftstore's read handler needs
+  disagreement-handling logic a write handler doesn't, purely because
+  sloppy quorum permits replicas to diverge in the first place.
+- **Reachability's flapping-is-fine stance is a direct consequence of
+  sloppy quorum existing at all.** GTStore has no quorum concept — every
+  replica gets every write — so it has no equivalent slack to spend. A
+  wrong-for-one-cycle routing decision here costs nothing structurally;
+  the same kind of local misjudgment in a write-all system would be a
+  correctness bug, not a tolerated inefficiency.
+
+### Implementation session — replica RPC boundary, reachability state, probe thread
+
+**KV storage + `ReplicateWrite`/`ReplicateRead` — implemented, verified.**
+`std::unordered_map<std::string, std::string> kv_store_` with its own
+mutex; `localPut`/`localGet` wrap it. `ReplicateWrite`/`ReplicateRead`
+are thin: `isSelfRemoved()` guard first (Q16 now confirmed in code, not
+just design), then a direct call into `localPut`/`localGet`. Verified
+against a single live node with no coordinator involved, via a new
+`harness/test_replica_boundary.sh` plus two new `client.cpp` modes
+(`--replicate-write=<key>=<value>`, `--replicate-read=<key>`): a
+write-then-read round-trips; a read on a never-written key returns
+`found=false`; and, the stronger check, a node that has self-removed via
+`--remove=<own address>` refuses a `ReplicateRead` for a key it's
+*known* to already hold (written before removal) — proving the guard
+actually fires, rather than merely proving the key is absent.
+**Confirmed passing.** Not covered by this harness, by design: whether
+`ReplicateWrite`'s `REMOVED` branch skips `localPut` internally vs.
+writing-then-discarding is unobservable externally once `REMOVED`, since
+`ReplicateRead` is blocked too — that's a code-inspection guarantee, not
+a test-harness one.
+
+**Reachability state — implemented.** `unreachable_peers_`
+(`std::unordered_set<std::string>`, presence = unreachable) plus its own
+mutex, as designed. API surface turned out to be three functions, not
+four: `markUnreachable(peer_id)`, `markReachable(peer_id)`, and
+`unreachableSnapshot()` (returns a copy of the current set). No
+`isReachable(single_id)` — traced every intended caller (the probe loop,
+`preferenceListForKey`), and neither ever asks about one peer in
+isolation; both only ever want "the whole current set," so a per-peer
+query was dropped as an API surface nothing would call.
+
+Wired into `SendGossip`'s existing success/failure branches
+(`markReachable`/`markUnreachable` on `peer_address`) — the only
+outbound RPC that exists in the codebase at this point. The other four
+triggers named in this section's original design (`Put`, `Get`,
+`ReplicateWrite`, `ReplicateRead` failures) have no caller yet — that's
+still steps 7/8, ahead — and are deliberately left unwired rather than
+built untested. Noting this explicitly so it doesn't read as finished
+when 4 of 5 intended trigger points don't exist yet.
+
+**`preferenceListForKey`'s nested-locking problem — resolved.** Feeding
+a *live* reachability check into the ring walk while `table_mutex_` is
+already held would establish `table_mutex_` → `unreachable_peers_mutex_`
+as a lock-acquisition order for the first time in this codebase — not
+itself a deadlock, but one waiting to happen the moment any other code
+path acquires the same two locks in the opposite order. Two alternatives
+considered and rejected before landing on the fix: (1) a single merged
+lock covering both `table_` and `unreachable_peers_` — rejected, since
+it would serialize reachability churn (which will happen on every RPC
+outcome once steps 7/8 exist) against ordinary gossip/membership work
+for no structural reason; (2) generating the plain preference list first
+and filtering reachability *afterward* — rejected, because
+`preferenceList()`'s walk is specifically built to skip a failing
+candidate and keep walking to find a replacement, so post-hoc filtering
+can silently return fewer than `N` even when `N` reachable candidates
+exist further down the ring, forcing the coordinator to re-derive the
+walk's own skip-and-continue logic one layer up. Actual fix: apply the
+existing snapshot-then-release-lock pattern `gossipRound`/
+`bootstrapFromSeed` already use for network calls, to a second-mutex
+acquisition instead — `unreachableSnapshot()` copies the set and
+releases `unreachable_peers_mutex_` *before* `table_mutex_` is ever
+taken, so the two locks are never held simultaneously and there's no
+ordering rule to violate or document. The copied set is captured by move
+into a `std::function<bool(const std::string&)>` closure passed to
+`preferenceList()`. Same staleness tolerance every other snapshot in
+this file already accepts (the set can be a few ms stale by the time the
+walk runs) — not a new kind of imprecision.
+
+**`preferenceList()`'s predicate — implemented in `ring.hpp` (author's
+own edit, not yet reviewed in chat).** Wraps the existing `seen`-dedupe
+check with the reachability predicate. Three rules settled explicitly
+before writing it: an unreachable candidate is skipped outright — never
+added to `seen`, never added to the result, even though it's a unique
+physical node; a reachable-and-already-seen candidate is skipped as
+before; a reachable-and-new candidate is added to both, as before. The
+deliberate cost of the first rule: an unreachable physical node with
+multiple vnodes gets re-rejected by the predicate once per vnode
+encountered in a single walk, instead of being remembered and skipped
+after the first rejection — accepted as bounded, wasted-but-not-incorrect
+work, since `visited >= ring.size()` still guarantees termination
+regardless of how many times any single candidate gets rejected. **Not
+yet confirmed:** the corresponding `test_ring.cpp` case (fabricated
+ring, a predicate excluding one node, confirming both the exclusion and
+that the three existing unrelated tests still pass against the new
+default-`true` parameter) was planned but not confirmed written or run
+as of this session.
+
+**Probe thread — implemented.** `reachabilityRound()`/
+`reachabilityLoop()`, same loop-then-sleep shape as `gossipLoop`,
+spawned as a second detached thread from `start()` (now
+`start(gossip_interval_ms, peer_interval_ms)`). Own flag,
+`--probe-interval=` — not shared with `--gossip-interval`, since the two
+serve different purposes and have no structural reason to share a
+clock. Probing within a round is concurrent (`std::async` per
+unreachable peer, `.get()` on all before the round ends) — same
+launch-all-wait-for-all shape as the fan-out decision above, chosen so
+one genuinely-dead peer can't block probes to others in the same round
+that may have already recovered. Each probe (`pingPeer`) uses a 500ms
+RPC deadline specifically so a dead peer can only cost the round a
+bounded amount of time — a starting value, not a tuned one. An empty
+unreachable set produces no log line at all — unlike `GOSSIP_NO_PEERS`
+(rare, notable), "nothing is currently unreachable" is the default
+healthy state on most ticks of a working cluster, so logging it every
+interval would be pure noise; actual probe attempts/outcomes still log
+via three new `EventType`s.
+
+**New `EventType`s: `PROBE_SENT`, `PROBE_SUCCEEDED`, `PROBE_FAILED`.**
+Deliberately distinct from the existing `PING_SENT`/`PING_SUCCEEDED`/
+`PING_FAILED`, which stay scoped to `client.cpp`'s human-initiated
+diagnostic ping. Reusing the existing three would conflate "someone ran
+a manual health check" with "the background probe thread's routine
+sweep" under one log signature — exactly the ambiguity correlated-log
+debugging can't afford. Same reasoning `GOSSIP_NO_PEERS`/`GOSSIP_FAILED`
+already established as precedent for splitting event types along a
+similar seam.
+
+#### Bugs caught during implementation (this session)
+
+- `std::unordered_set<const std::string&> unreachable_peers_` —
+  reference types aren't valid container value types (no
+  default-constructibility, no reassignment); fixed to plain
+  `std::string`.
+- `ReplicateWrite`'s `if (isSelfRemoved)` — missing call parentheses; a
+  bare non-static member function name isn't a valid standalone
+  expression. `ReplicateRead`'s equivalent check was written correctly
+  in the same draft, so this was an inconsistency between the two
+  handlers, not a repeated misunderstanding.
+- `localPut(request->key, request->value)` / `localGet(request->key)` —
+  missing `()` on protobuf accessor methods.
+- `return grpc::Status:OK;` (single colon) in both `ReplicateWrite` and
+  `ReplicateRead` — not `::`.
+- `ReplicateRead`'s `REMOVED` branch called
+  `response->set_success(false)` — `ReplicateReadResponse` has no
+  `success` field (only `found`/`value`); a copy-paste artifact from
+  `ReplicateWrite`'s branch just above it in the same draft.
+- Both handlers initially declared with `StatusRequest`/`StatusResponse`
+  parameter types (copy-paste from `GetStatus`) instead of their own
+  generated `Replicate{Write,Read}{Request,Response}` types — caught by
+  `override` refusing to compile once the proto's real RPC names were in
+  use, exactly the failure mode `override` exists to catch.
+- `localGet`: `kv_store.find()` (missing trailing underscore, called
+  with no argument), the returned iterator treated as if it were the
+  stored value itself, and a missing `return std::nullopt;` on the
+  not-found path — same undefined-behavior-via-falling-off-a-non-void-
+  function bug class as the `toString(EventType)`/`GOSSIP_NO_PEERS`
+  crash logged under Phase 1.
+- `markUnreachable`'s body called `unreachable_peers_.insert(node_id)` —
+  `node_id` undeclared in that scope; the parameter is `peer_id`.
+  `markReachable`, written correctly in the same pass, uses `peer_id`
+  properly — another same-draft inconsistency, not a repeated
+  misunderstanding of the concept.
+- `preferenceListForKey`'s lambda captured a set under the name
+  `unreachable_peers` (via
+  `[unreachable_peers = std::move(unreachable_peers)]`) but the body
+  referenced `unreachable` — undeclared identifier.
+- `reachabilityLoop` had no `std::this_thread::sleep_for(...)` between
+  rounds — a busy-spin bug the compiler can't catch, found by comparison
+  against `gossipLoop`'s otherwise-identical shape.
+- `main()` still calls `service.start(gossip_interval_ms)` with one
+  argument after `start()`'s signature grew to two
+  (`gossip_interval_ms, peer_interval_ms`) — **flagged, fix given, not
+  yet confirmed applied.** Needs a new `--probe-interval=` flag (same
+  parsing pattern as `--gossip-interval=`) and the updated call site.
+  Compile-blocking, not a design question — first thing to check in a
+  resumed session.
+
+#### GTStore comparisons made this session
+
+- **`N` vs. `W`/`R` as separate concepts has no GTStore analogue.**
+  GTStore's write-all/ack-all model has no notion of "enough replicas
+  exist to possibly succeed" as distinct from "all replicas exist" — `K`
+  (its replica count) is simultaneously the target list size and the
+  success threshold, because it's always both at once. Driftstore
+  splitting `preference_list.size()` (bounded by `N`) from the actual
+  pass/fail gate (`W`/`R`) is what makes a coordinator's fan-out
+  meaningfully different from a `K`-of-`K` write: a shortfall against
+  `N` isn't automatically a shortfall against the thing that actually
+  decides success.
+- **The probe thread is a mechanism GTStore never needed at all.**
+  GTStore's manager is assumed reachable — there's no local, per-node
+  belief about a peer's liveness to maintain, because no node other than
+  the manager ever needs an opinion about who else is up. Driftstore's
+  probe thread (and the reachability state it feeds) exists specifically
+  because "any node can coordinate" means every node independently needs
+  its own, possibly-wrong, self-correcting opinion about who's currently
+  reachable — there's no single authority to just ask instead.
+
+#### Not yet done — resume point for Phase 3
+
+- `main()`: add `--probe-interval=` flag, update `service.start(...)`
+  call to pass both intervals. Compile-blocking as of this session's
+  last code shown — check this first.
+- `ring.hpp`'s predicate change and the corresponding `test_ring.cpp`
+  case: written per description, not yet reviewed in chat, not yet
+  confirmed passing.
+- `N`/`W`/`R` CLI flags + startup validation (`N,W,R >= 1`, `W,R <= N`,
+  `W + R > N` — see the design-lock section above): decided, not
+  implemented.
+- `Put`/`Get` coordinator handlers (fan-out to `ReplicateWrite`/
+  `ReplicateRead`, quorum counting against `W`/`R`,
+  concurrent-launch-wait-for-all per the semantics locked above): not
+  started. Flagged throughout as worth designing/writing personally
+  rather than treating as boilerplate.
+- `REMOVED` guard on `Put`/`Get` themselves (a separate call site from
+  `ReplicateWrite`/`ReplicateRead`'s already-working guard): not
+  started.
+- `DriftClient` library (`connect(seed_nodes)` with fallback, `put`/
+  `get`): not started.
+- End-to-end verification harness (3-node cluster, kill one, write with
+  `W < N`, confirm success, confirm the coordinator's log line and the
+  killed replica's absence correlate): not started — natural next step
+  once `Put`/`Get` exist.
+
+---
 
 ## How to update this file
 When a phase wraps: flip its status in the table, add a summary block (what

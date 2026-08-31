@@ -130,48 +130,6 @@ used as rough precedent for the static-list decision.
 
 *Context:* raised during Phase 1 `bootstrapFromSeed` retry/backoff design.
 
-### Q15 — Should a live node that's learned its own status is `REMOVED` stop participating in gossip?
-Surfaced during Phase 2 design while tracing what actually happens to a node
-that's administratively removed but never killed: its own local table entry
-for itself genuinely flips to `REMOVED` via ordinary gossip merge — see
-`PROGRESS.md`'s Phase 1 correction, added this same session. Nothing
-currently acts on that. Two separable sub-questions: (1) should
-`gossipRound` check self-status before calling `selectGossipTarget`,
-refusing to *initiate* further gossip once self-status is `REMOVED`; (2)
-should the inbound `GossipExchange` handler *also* decline to respond or
-merge once self-status is `REMOVED`, or is answering peers harmless since
-nothing downstream depends on it.
-
-*Status:* unresolved, not blocking Phase 2 — no data path currently depends
-on the answer. Leaning yes on (1), gated inside `gossipRound` itself rather
-than inside `selectGossipTarget` — folding it into target selection would
-mean a `nullopt` return conflates "no `UP` peers exist" with "chose not to
-look," both currently logged as `GOSSIP_NO_PEERS`; a genuinely no-peers
-situation and a deliberate self-removed silence should probably be
-distinguishable in the logs (e.g. a new `GOSSIP_SELF_REMOVED` event) rather
-than collapsed into one that already means something else. Leaning no on
-(2) — a node can't prevent peers from dialing it regardless of what it does
-internally, and refusing to answer or merge doesn't buy anything it doesn't
-already not-get from going silent as an initiator. Neither lean is locked.
-Worth deciding before Phase 8's kill/restart fault injection, where a
-remove-without-kill scenario producing a quietly-still-gossiping "removed"
-node is exactly the kind of thing that'd be confusing to debug fresh if
-it's still undecided by then.
-
-*Context:* raised during Phase 2 design conversation, after confirming
-empirically that a live-but-removed node's own view of itself does flip to
-`REMOVED`.
-
-### Q16 — Once Phase 3 exists, should a `REMOVED` node decline to coordinate or hold data?
-Related to Q15 but a separate layer: even if a `REMOVED` node keeps
-gossiping normally, should it also refuse to act as a coordinator or serve
-as a replica for a key, once it's aware of its own removed status? No
-coordinator exists yet, so nothing currently depends on the answer either
-way.
-
-*Status:* unresolved, explicitly deferred to Phase 3 design.
-*Context:* raised alongside Q15, Phase 2 design conversation.
-
 ### Q17 — Phase 2's ring-mutation test coverage: two of five points still open, by choice
 `test_ring.cpp` now covers three of the five ring-mutation points —
 new-node discovery, and `REMOVED→UP`/`UP→REMOVED` via a chained
@@ -201,6 +159,37 @@ live-observability gap.
 done with this gap known and documented, not discovered later.
 *Context:* surfaced closing out Phase 2; narrowed after `testReboot` was
 added; final scope decided explicitly rather than by default.
+
+**Update, later session:** option (c) — a minimal debug RPC exposing
+`ring_` — is now implemented (`ring_dump` on `GetStatus`) and was used to
+run a live 2→3 node join scenario, diffed before/after (see
+`PROGRESS.md`'s Phase 2 addendum for the full result). This closes the
+specific "no live multi-node test, no RPC surface" reasoning that made
+both remaining gaps hard to close — but doesn't itself add coverage for
+either one. `RemoveNode`'s direct erasure and the `UP→UP` refresh path
+both remain untested; the tooling to write those tests now exists, closing
+them is still a separate, undone step.
+
+### Q18 — Should `GetStatus` expose the current `unreachable_peers_` set?
+Reachability state is deliberately private and non-gossiped (see
+`PROGRESS.md`'s Phase 3 design section) — but that also means there's
+currently no way to observe a node's own reachability belief from
+outside it at all, unlike `table_`/`ring_`, which `GetStatus` already
+exposes via `table_dump`/`ring_dump`. Raised while designing the probe
+thread's verification story: confirming "a peer landed in the
+unreachable set" currently requires trusting log lines (`GOSSIP_FAILED`,
+`PROBE_FAILED`) rather than querying live state directly.
+
+*Status:* unresolved, not blocking — probe thread and reachability
+marking work and are logged either way; this is purely a live
+debugging/observability convenience, not a correctness question. Worth
+weighing against the same log-vs-noise instinct already applied to the
+empty-set case (see `PROGRESS.md`'s probe thread section): exposing it
+is arguably the same category as `ring_dump` — additive, cheap — but
+it's still new surface on `GetStatus`, not something to add reflexively
+just because it's easy.
+
+*Context:* raised during the probe thread design/implementation session.
 
 ---
 
@@ -419,3 +408,63 @@ routes around a hung peer") that isn't due until Phase 3 regardless.
 
 *Context:* raised during Phase 1 proto/schema work.
 *Resolved during:* Phase 2 design conversation.
+
+**Update, Phase 3 implementation session:** now actually implemented.
+`ring.hpp`'s `preferenceList()` takes a
+`std::function<bool(const std::string&)>` predicate (default
+always-`true`), and `NodeServiceImpl::preferenceListForKey` supplies it
+from a snapshot of `unreachable_peers_`, taken and released *before*
+`table_mutex_` is acquired specifically so the two locks are never held
+at once. See `PROGRESS.md`'s Phase 3 implementation section for the two
+rejected alternatives (a single merged lock; filtering the list after
+generating it) and the three walk rules the predicate enforces.
+
+### Q15 — Should a live node that's learned its own status is `REMOVED` stop participating in gossip?
+Surfaced during Phase 2 design: two sub-questions — (1) should a
+self-`REMOVED` node stop *initiating* gossip, (2) should it also decline
+*inbound* `GossipExchange`.
+
+**Resolution:** (1) yes — stop initiating once self-status is confirmed
+`REMOVED`; nothing left to usefully learn or contribute at that point.
+(2) no — inbound gossip must never be gated, for the opposite reason
+originally given. The original lean toward "no" reasoned that refusing to
+answer "doesn't buy anything it doesn't already not-get from going silent
+as an initiator" — that reasoning was backwards. Gossip propagating a
+removal to *other* nodes happens through the removing node's own outbound/
+inbound gossip, entirely independent of whether the removed node itself
+ever gossips again. What inbound gossip actually provides is the *only*
+way the removed node itself finds out it's been removed — if it declined
+inbound `GossipExchange` the moment it (incorrectly) believed itself
+still-`UP`, it could never receive the fact that changes that belief, and
+would keep coordinating/serving indefinitely, the exact failure Q16
+exists to prevent. Gossip stays open so the removed node can *learn* it's
+removed, not so others can learn it from *this* node specifically.
+
+*Context:* raised during Phase 2 design conversation.
+*Resolved during:* Phase 3 design conversation.
+
+### Q16 — Once Phase 3 exists, should a `REMOVED` node decline to coordinate or hold data?
+Related to Q15 but a separate layer: should a `REMOVED` node refuse to act
+as coordinator or replica once it knows its own status.
+
+**Resolution:** Yes — declines `Put`, `Get`, `ReplicateWrite`, and
+`ReplicateRead` (client-facing and internal replication data-path RPCs).
+Continues answering `GetStatus` and `Ping` — both diagnostic, and refusing
+them would make it *harder* to verify a node correctly knows its own
+status (reduced to inferring removal from a dropped connection instead of
+reading its own status dump). `ReplicateRead` was folded in explicitly
+after being added to the proto later than `Put`/`Get`/`ReplicateWrite` —
+worth noting since it's exactly the kind of gap that's easy to miss once
+a decision looks already-settled.
+
+*Context:* raised alongside Q15, Phase 2 design conversation.
+*Resolved during:* Phase 3 design conversation.
+
+**Update, Phase 3 implementation session:** confirmed in code and by
+test. `isSelfRemoved()` now guards `ReplicateWrite`/`ReplicateRead`;
+`harness/test_replica_boundary.sh` verifies a self-removed node refuses
+a `ReplicateRead` for a key it's known to already hold (written before
+removal), not just a missing key — proving the guard actually fires
+rather than merely proving the key's absence. `Put`/`Get`'s equivalent
+guard (a separate call site from `ReplicateWrite`/`ReplicateRead`'s) is
+still pending, since `Put`/`Get` themselves don't exist yet.

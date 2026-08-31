@@ -1,4 +1,5 @@
 #include "ring.hpp"
+#include "logging.hpp"
 #include <cassert>
 #include <cstdio>
 
@@ -56,7 +57,7 @@ void testKillAndReboot() {
     printf("test remove node (ring effect) and reboot (ring effect): PASS\n");
 }
 
-int main() {
+void testRingAndPrefList() {
     driftstore::MembershipTable local;
     std::map<uint64_t, std::string> ring;
     
@@ -86,8 +87,42 @@ int main() {
     assert(prefs.size() == 1 && prefs[0] == "peerB");
 
     printf("test 1 (new-node ring insert): PASS\n");
+}
 
+void testReachabilityPredicate() {
+    // Think of various cases to test for reachability with predicate passed in
+    // What happens if we have nodes, and then one of them that would be in the preference_list is unreachable?
+    // What happens if just add nodes? Make sure they are marked as "reachable" --> initial value
+    // So overall, make sure that reachability is actually checked and different results that come from this.
+    std::map<uint64_t, std::string> ring = {
+        {10, "A"}, {20, "B"}, {30, "A"}, {40, "C"}, {50, "B"}, {60, "C"}
+    };
+    uint64_t key_hash = 5;
+    // When we call excludeB, inside of preferenceList (where we pass in 'candidate')
+    // if node is B, then return false --> indicating that this is UNreachable
+    auto excludeB = [](const std::string& node_id) {
+        return node_id != "B";
+    };
+    // Generate preferenceList and see if the "reachability" status is enforced (properly excluding node B)
+    auto prefs1 = preferenceList(ring, key_hash, /*N=*/2, excludeB);
+    for (const auto& node_id : prefs1) {
+        assert(node_id != "B");
+    }
+    printf("test predicate case 1 (exclude one node, walk continues past it): PASS\n");
+
+    auto onlyA = [](const std::string& node_id) {
+        return node_id == "A";
+    };
+    std::vector<std::string> prefs2 = preferenceList(ring, key_hash, 2, onlyA);
+    assert(prefs2.size() == 1);
+    assert(prefs2[0] == "A");
+    printf("test predicate case 2 (short list when predicate excludes below N): PASS\n");
+}
+
+int main() {
+    testRingAndPrefList();
     testKillAndReboot();
-    
+    testReachabilityPredicate();
+
     return 0;
 }

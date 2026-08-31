@@ -6,6 +6,7 @@
 #include <string>
 #include <unordered_set>
 #include <vector>
+#include <functional>
 
 uint64_t mix64(uint64_t x) {
     x ^= x >> 30;
@@ -54,7 +55,7 @@ inline void mergeInto(driftstore::MembershipTable& local,
                 logEvent(EventType::NODE_REBOOTED, caller_node_id, "node_id=" + node_id + " status=" + (local_entry.status() == driftstore::UP ? "UP" : "REMOVED") + 
                         " writer_id=" + incoming_entry.writer_id() + " last_updated=" + std::to_string(incoming_entry.last_updated()));
             } else if (local_entry.status() == driftstore::UP && incoming_entry.status() == driftstore::REMOVED) {
-                for (const auto& token : local_entry.tokens()) { // incoming_entry OR local_entry?????? THINK
+                for (const auto& token : local_entry.tokens()) {
                     ring.erase(token);
                 }
             }
@@ -65,7 +66,8 @@ inline void mergeInto(driftstore::MembershipTable& local,
 
 inline std::vector<std::string> preferenceList(const std::map<uint64_t, std::string>& ring,
                                                 uint64_t key_hash,
-                                                int N) {
+                                                int N,
+                                                std::function<bool(const std::string&)> is_reachable = [](const std::string&) { return true; }) {
     std::vector<std::string> preference_list;
     if (ring.empty()) {
         return preference_list;
@@ -79,9 +81,11 @@ inline std::vector<std::string> preferenceList(const std::map<uint64_t, std::str
     size_t visited = 0;
     while (true) {
         const std::string& candidate = it->second;
-        if (seen.find(candidate) == seen.end()) { // if candidate is UNIQUE physical node
-            seen.insert(candidate);
-            preference_list.push_back(candidate);
+        if (is_reachable(candidate)) {
+            if (seen.find(candidate) == seen.end()) { // if candidate is UNIQUE physical node
+                seen.insert(candidate);
+                preference_list.push_back(candidate);
+            }
         }
         ++visited;
         if ((static_cast<int>(preference_list.size()) == N) || (visited >= ring.size())) {

@@ -26,6 +26,12 @@ enum class EventType {
     PROBE_SENT,
     PROBE_SUCCEEDED,
     PROBE_FAILED,
+    GET_INIT,
+    GET_SUCCEEDED,
+    GET_FAILED,
+    PUT_INIT,
+    PUT_SUCCEEDED,
+    PUT_FAILED,
 };
 
 inline const char* toString(EventType e) {
@@ -51,6 +57,12 @@ inline const char* toString(EventType e) {
         case EventType::PROBE_SENT: return "PROBE_SENT";
         case EventType::PROBE_SUCCEEDED: return "PROBE_SUCCEEDED";
         case EventType::PROBE_FAILED: return "PROBE_FAILED";
+        case EventType::GET_INIT: return "GET_INIT";
+        case EventType::GET_SUCCEEDED: return "GET_SUCCEEDED";
+        case EventType::GET_FAILED: return "GET_FAILED";
+        case EventType::PUT_INIT: return "PUT_INIT";
+        case EventType::PUT_SUCCEEDED: return "PUT_SUCCEEDED";
+        case EventType::PUT_FAILED: return "PUT_FAILED";
     }
 }
 

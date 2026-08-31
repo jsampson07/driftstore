@@ -325,6 +325,10 @@ Before path: the ring did not have N distinct UP physical nodes in cluster (no c
 Treat both situations the same: `preference_list.size() < N`. Whether its because there are less than N physical nodes
 versus less than N reachable nodes should lead to the same outcome. Failed write/read.
 
+**How should N/W/R be configured across the system?**
+
+PROBLEM I was thinking: if N/W/R are different across different nodes, then this leads to wildly inconsistent copies of data and retrievals.
+
 ## Vector clocks & conflict resolution
 _Fill in once Phase 4 is designed._
 

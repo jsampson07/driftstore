@@ -199,6 +199,7 @@ public:
         if (isSelfRemoved()) {
             logEvent(EventType::PUT_FAILED, node_id_, "reason=self_removed");
             response->set_success(false);
+            response->set_acks(0);
             return grpc::Status::OK;
         }
         
@@ -206,7 +207,7 @@ public:
         std::string value = request->value();
         std::vector<std::string> pref_list = preferenceListForKey(key, N_);
         if (pref_list.size() < W_) {
-            logEvent(EventType::PUT_FAILED, node_id_, "W=" + std::to_string(W_) + " preference_list_size=" + std::to_string(static_cast<int>(pref_list.size())));
+            logEvent(EventType::PUT_FAILED, node_id_, "key=" + key + " val=" + value + " W=" + std::to_string(W_) + " preference_list_size=" + std::to_string(static_cast<int>(pref_list.size())));
             return grpc::Status::OK;
         }
 
@@ -249,12 +250,12 @@ public:
         }
 
         if (acks < W_) {
-            logEvent(EventType::PUT_FAILED, node_id_, "W=" + std::to_string(W_) + " acks=" + std::to_string(acks.load()));
+            logEvent(EventType::PUT_FAILED, node_id_, "key=" + key + " val=" + value + " W=" + std::to_string(W_) + " acks=" + std::to_string(acks.load()));
             response->set_success(false);
             response->set_acks(acks.load());
             return grpc::Status::OK;
         }
-        logEvent(EventType::PUT_SUCCEEDED, node_id_, "W=" + std::to_string(W_) + " acks=" + std::to_string(acks.load()));
+        logEvent(EventType::PUT_SUCCEEDED, node_id_, "key=" + key + " val=" + value + " W=" + std::to_string(W_) + " acks=" + std::to_string(acks.load()));
         response->set_success(true);
         response->set_acks(acks.load());
         return grpc::Status::OK;
@@ -274,7 +275,7 @@ public:
         std::vector<std::string> pref_list = preferenceListForKey(key, N_);
         // If pref list size < R then read will ALWAYS fail
         if (static_cast<int>(pref_list.size()) < R_) {
-            logEvent(EventType::GET_FAILED, node_id_, "R=" + std::to_string(R_) + " preference_list_size=" + std::to_string(pref_list.size()));
+            logEvent(EventType::GET_FAILED, node_id_, "key=" + key + " R=" + std::to_string(R_) + " preference_list_size=" + std::to_string(pref_list.size()));
             return grpc::Status::OK;
         }
 
@@ -370,7 +371,7 @@ public:
             response->set_value(final_r.value);
         }
         response->set_responses(results.size());
-        logEvent(EventType::GET_SUCCEEDED, node_id_);
+        logEvent(EventType::GET_SUCCEEDED, node_id_, "key=" + key);
         return grpc::Status::OK;
     }
 

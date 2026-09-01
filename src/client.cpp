@@ -14,6 +14,8 @@ int main(int argc, char** argv) {
     std::string remove_target;
     std::string rwrite_kv;
     std::string rread_key;
+    std::string put_kv;
+    std::string get_key;
     bool status_mode = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -22,6 +24,8 @@ int main(int argc, char** argv) {
         static constexpr char kRemovePrefix[] = "--remove=";
         static constexpr char kRWritePrefix[] = "--replicate-write=";
         static constexpr char kRReadPrefix[] = "--replicate-read=";
+        static constexpr char kPutPrefix[] = "--put=";
+        static constexpr char kGetPrefix[] = "--get=";
         if (arg.rfind(kTargetPrefix, 0) == 0) {
             target = arg.substr(sizeof(kTargetPrefix) - 1);
         } else if (arg.rfind(kSelfPrefix, 0) == 0) {
@@ -32,6 +36,10 @@ int main(int argc, char** argv) {
             rwrite_kv = arg.substr(sizeof(kRWritePrefix) - 1);
         } else if (arg.rfind(kRReadPrefix, 0) == 0) {
             rread_key = arg.substr(sizeof(kRReadPrefix) - 1);
+        } else if (arg.rfind(kPutPrefix, 0) == 0) {
+            put_kv = arg.substr(sizeof(kPutPrefix) - 1);
+        } else if (arg.rfind(kGetPrefix, 0) == 0) {
+            get_key = arg.substr(sizeof(kGetPrefix) - 1);
         } else if (arg == "--status") {
             status_mode = true;
         }
@@ -40,16 +48,20 @@ int main(int argc, char** argv) {
     const bool remove_mode = !remove_target.empty();
     const bool rwrite_mode = !rwrite_kv.empty();
     const bool rread_mode = !rread_key.empty();
+    const bool put_mode = !put_kv.empty();
+    const bool get_mode = !get_key.empty();
 
     if (target.empty() ||
-        (!status_mode && !remove_mode && !rwrite_mode && !rread_mode && self.empty())) {
+        (!status_mode && !remove_mode && !rwrite_mode && !rread_mode && !put_mode && !get_mode && self.empty())) {
         std::fprintf(stderr,
             "usage: %s --target=<address> --self=<node_id>\n"
             "       %s --target=<address> --status\n"
             "       %s --target=<address> --remove=<node_id>\n"
             "       %s --target=<address> --replicate-write=<key>=<value>\n"
-            "       %s --target=<address> --replicate-read=<key>\n",
-            argv[0], argv[0], argv[0], argv[0], argv[0]);
+            "       %s --target=<address> --replicate-read=<key>\n"
+            "       %s --target=<address> --put=<key>=<value>\n"
+            "       %s --target=<address> --get=<key>\n",
+            argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 1;
     }
 
@@ -137,6 +149,55 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "replicate-read RPC failed: target=%s key=%s error=%s\n",
                      target.c_str(), rread_key.c_str(), status.error_message().c_str());
+        return 1;
+    }
+
+    if (put_mode) {
+        auto eq = put_kv.find('=');
+        if (eq == std::string::npos) {
+            std::fprintf(stderr, "usage: --put=<key>=<value> (no '=' found in \"%s\")\n",
+                         put_kv.c_str());
+            return 1;
+        }
+        const std::string key = put_kv.substr(0, eq);
+        const std::string value = put_kv.substr(eq + 1);
+
+        driftstore::PutRequest request;
+        request.set_key(key);
+        request.set_value(value);
+        driftstore::PutResponse response;
+        grpc::ClientContext context;
+        context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(2));
+        grpc::Status status = stub->Put(&context, request, &response);
+
+        if (status.ok()) {
+            std::printf("put key=%s value=%s success=%s acks=%s\n",
+                        key.c_str(), value.c_str(), response.success() ? "true" : "false",
+                        std::to_string(response.acks()).c_str());
+            return response.success() ? 0 : 1;
+        }
+        std::fprintf(stderr, "put RPC failed: target=%s key=%s error=%s\n",
+                     target.c_str(), key.c_str(), status.error_message().c_str());
+        return 1;
+    }
+
+    if (get_mode) {
+        driftstore::GetRequest request;
+        request.set_key(get_key);
+        driftstore::GetResponse response;
+        grpc::ClientContext context;
+        context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(2));
+        grpc::Status status = stub->Get(&context, request, &response);
+
+        if (status.ok()) {
+            std::printf("get key=%s found=%s value=%s responses=%s\n",
+                        get_key.c_str(), response.found() ? "true" : "false",
+                        response.found() ? response.value().c_str() : "",
+                        std::to_string(response.responses()).c_str());
+            return 0;
+        }
+        std::fprintf(stderr, "get RPC failed: target=%s key=%s error=%s\n",
+                     target.c_str(), get_key.c_str(), status.error_message().c_str());
         return 1;
     }
 

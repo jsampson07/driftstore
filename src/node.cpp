@@ -17,6 +17,7 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <future>
+#include <climits> // Required for INT_MAX
 
 namespace {
 
@@ -84,7 +85,7 @@ std::vector<std::string> splitSeeds(const std::string& raw) {
 
 class NodeServiceImpl final : public driftstore::DriftStoreNode::Service {
 public:
-    explicit NodeServiceImpl(std::string node_id, int vnodes) : node_id_(std::move(node_id)), vnodes_(vnodes) {
+    explicit NodeServiceImpl(std::string node_id, int vnodes, int N, int W, int R) : node_id_(std::move(node_id)), vnodes_(vnodes), N_(N), W_(W), R_(R) {
         driftstore::MembershipEntry self_entry;
         self_entry.set_writer_id(node_id_);
         self_entry.set_address(node_id_);
@@ -188,6 +189,188 @@ public:
         if (value) {
             response->set_value(*value);
         }
+        return grpc::Status::OK;
+    }
+
+    grpc::Status Put(grpc::ServerContext* /*context*/,
+                    const driftstore::PutRequest* request,
+                    driftstore::PutResponse* response) override {
+        // If client had stale view of node membership and request routed to REMOVED node, MUST not handle/service request --> FAIL
+        if (isSelfRemoved()) {
+            logEvent(EventType::PUT_FAILED, node_id_, "reason=self_removed");
+            response->set_success(false);
+            return grpc::Status::OK;
+        }
+        
+        std::string key = request->key();
+        std::string value = request->value();
+        std::vector<std::string> pref_list = preferenceListForKey(key, N_);
+        if (pref_list.size() < W_) {
+            logEvent(EventType::PUT_FAILED, node_id_, "W=" + std::to_string(W_) + " preference_list_size=" + std::to_string(static_cast<int>(pref_list.size())));
+            return grpc::Status::OK;
+        }
+
+        std::atomic<int64_t> acks{0}; // IMPORTANT to make it atomic as two threads can read same value, increment ==> LOSE an ack
+
+        for (const auto& peer_id : pref_list) {
+            if (peer_id == node_id_) {
+                localPut(key, value);
+                acks++;
+                break;
+            }
+        }
+
+        std::vector<std::future<void>> futures;
+        for (const auto& peer_id : pref_list) {
+            if (peer_id == node_id_) {
+                continue;
+            }
+            futures.push_back(std::async(std::launch::async,
+                [this, peer_id, key, value, &acks]() {
+                    auto channel = grpc::CreateChannel(peer_id, grpc::InsecureChannelCredentials());
+                    std::unique_ptr<driftstore::DriftStoreNode::Stub> stub =
+                        driftstore::DriftStoreNode::NewStub(channel);
+    
+                    driftstore::ReplicateWriteRequest req;
+                    req.set_key(key);
+                    req.set_value(value);
+                    driftstore::ReplicateWriteResponse resp;
+                    grpc::ClientContext context;
+                    grpc::Status status = stub->ReplicateWrite(&context, req, &resp);
+                    
+                    if (status.ok() && resp.success()) {
+                        acks++;
+                    } // if NOT OK or NOT success then either Put RPC failed or wrote to REMOVED node --> treat the same way, do NOT increment 'acks'
+                }));
+        }
+
+        for (auto& f : futures) {
+            f.get();
+        }
+
+        if (acks < W_) {
+            logEvent(EventType::PUT_FAILED, node_id_, "W=" + std::to_string(W_) + " acks=" + std::to_string(acks.load()));
+            response->set_success(false);
+            response->set_acks(acks.load());
+            return grpc::Status::OK;
+        }
+        logEvent(EventType::PUT_SUCCEEDED, node_id_, "W=" + std::to_string(W_) + " acks=" + std::to_string(acks.load()));
+        response->set_success(true);
+        response->set_acks(acks.load());
+        return grpc::Status::OK;
+    }
+
+    grpc::Status Get(grpc::ServerContext* /*context*/,
+                    const driftstore::GetRequest* request,
+                    driftstore::GetResponse* response) override {
+        if (isSelfRemoved()) {
+            logEvent(EventType::GET_FAILED, node_id_, "reason=self_removed");
+            response->set_found(false);
+            return grpc::Status::OK;
+        }
+        
+        std::string key = request->key();
+        // Generate preference list for this key
+        std::vector<std::string> pref_list = preferenceListForKey(key, N_);
+        // If pref list size < R then read will ALWAYS fail
+        if (static_cast<int>(pref_list.size()) < R_) {
+            logEvent(EventType::GET_FAILED, node_id_, "R=" + std::to_string(R_) + " preference_list_size=" + std::to_string(pref_list.size()));
+            return grpc::Status::OK;
+        }
+
+        // Used to represent a result (includes arrival_order to track each result)
+        struct ReplicaResult {
+            std::string peer_id;
+            bool found = false;
+            std::string value;
+            int arrival_order = -1;
+        };
+
+        std::vector<ReplicaResult> results;
+        std::mutex results_mutex;
+        int next_arrival = 0;
+
+        // First check if we can have local read AND no self-RPC
+
+        logEvent(EventType::GET_INIT, node_id_);
+        for (const auto& peer_id : pref_list) {
+            if (peer_id == node_id_) {
+                std::optional<std::string> local_value = localGet(key);
+                ReplicaResult r;
+                r.peer_id = peer_id;
+                r.found = local_value.has_value();
+                if (local_value) {
+                    r.value = *local_value;
+                }
+                r.arrival_order = next_arrival++;
+                results.push_back(std::move(r));
+                break;
+            }
+        }
+
+        std::vector<std::future<void>> futures;
+        for (const auto& peer_id : pref_list) {
+            if (peer_id == node_id_) {
+                continue;
+            }
+            futures.push_back(std::async(std::launch::async,
+                [this, peer_id, key, &results, &results_mutex, &next_arrival]() {
+                    auto channel = grpc::CreateChannel(peer_id, grpc::InsecureChannelCredentials());
+                    std::unique_ptr<driftstore::DriftStoreNode::Stub> stub =
+                        driftstore::DriftStoreNode::NewStub(channel);
+    
+                    driftstore::ReplicateReadRequest req;
+                    req.set_key(key);
+                    driftstore::ReplicateReadResponse resp;
+                    grpc::ClientContext context;
+                    grpc::Status status = stub->ReplicateRead(&context, req, &resp);
+
+                    /**
+                    * There is clear distinction between status returning OK and key not being found.
+                    * If a key is NOT found, this is a LEGITIMATE response we want in our 'results'.
+                    * If a ReplicateRead FAILS, then this is a FAILED attempt, where we do NOT want our result to be recorded.
+                    *
+                    * KEY distinction: include results that are successful but may be found/NOT found versus exclude FAILED RPC requests
+                    */
+                    if (status.ok()) {
+                        ReplicaResult r;
+                        r.peer_id = peer_id;
+                        r.found = resp.found();
+                        if (r.found) {
+                            r.value = resp.value();
+                        }
+                        std::lock_guard<std::mutex> lock(results_mutex);
+                        r.arrival_order = next_arrival++;
+                        results.push_back(std::move(r));
+                    }
+                }));
+        }
+
+        for (auto& f : futures) {
+            f.get();
+        }
+
+        if (static_cast<int>(results.size()) < R_) {
+            logEvent(EventType::GET_FAILED, node_id_, "key=" + key + " R=" + std::to_string(R_) + " responses=" + std::to_string(results.size()));
+            response->set_responses(results.size());
+            return grpc::Status::OK;
+        }
+
+        // We have >= R responses
+        ReplicaResult final_r;
+        int min_arrival_order = INT_MAX;
+        for (const auto& res : results) {
+            if (res.arrival_order < min_arrival_order) {
+                final_r = res;
+                min_arrival_order = res.arrival_order;
+            }
+        }
+        response->set_found(final_r.found);
+        if (final_r.found) {
+            response->set_value(final_r.value);
+        }
+        response->set_responses(results.size());
+        logEvent(EventType::GET_SUCCEEDED, node_id_);
         return grpc::Status::OK;
     }
 
@@ -327,6 +510,9 @@ private:
     std::mutex unreachable_peers_mutex_;
     std::unordered_map<std::string, std::string> kv_store_;
     std::mutex kv_store_mutex_;
+    int64_t N_;
+    int64_t W_;
+    int64_t R_;
 
     bool pingPeer(const std::string& peer_addr) {
         auto channel = grpc::CreateChannel(peer_addr, grpc::InsecureChannelCredentials());
@@ -468,6 +654,9 @@ int main(int argc, char** argv) {
     std::string gossip_interval_ms = "1000";
     std::string reachability_interval_ms = "3000";
     std::string vnodes_str = "32";
+    std::string n_str = "3";
+    std::string w_str = "2";
+    std::string r_str = "2";
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         static constexpr char kListenPrefix[] = "--listen=";
@@ -475,6 +664,9 @@ int main(int argc, char** argv) {
         static constexpr char kGossipIntervalPrefix[] = "--gossip-interval=";
         static constexpr char kReachabilityIntervalPrefix[] = "--probe-interval=";
         static constexpr char kVnodesPrefix[] = "--vnodes=";
+        static constexpr char kNPrefix[] = "--N=";
+        static constexpr char kWPrefix[] = "--W=";
+        static constexpr char kRPrefix[] = "--R=";
         if (arg.rfind(kListenPrefix, 0) == 0) {
             listen = arg.substr(sizeof(kListenPrefix) - 1);
         } else if (arg.rfind(kSeedPrefix, 0) == 0) {
@@ -485,6 +677,12 @@ int main(int argc, char** argv) {
             reachability_interval_ms = arg.substr(sizeof(kReachabilityIntervalPrefix) - 1);
         } else if (arg.rfind(kVnodesPrefix, 0) == 0) {
             vnodes_str = arg.substr(sizeof(kVnodesPrefix) - 1);
+        } else if (arg.rfind(kNPrefix, 0) == 0) {
+            n_str = arg.substr(sizeof(kNPrefix) - 1);
+        } else if (arg.rfind(kWPrefix, 0) == 0) {
+            w_str = arg.substr(sizeof(kWPrefix) - 1);
+        } else if (arg.rfind(kRPrefix, 0) == 0) {
+            r_str = arg.substr(sizeof(kRPrefix) - 1);
         }
     }
     if (listen.empty()) {
@@ -495,11 +693,23 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    const int N = std::stoi(n_str);
+    const int W = std::stoi(w_str);
+    const int R = std::stoi(r_str);
+    // W + R > N, and W, R <= N
+    if (N < 1 || W < 1 || R < 1 || W > N || R > N || (W + R) <= N) {
+        std::fprintf(stderr,
+            "invalid quorum config: N=%d W=%d R=%d "
+            "(require N,W,R >= 1, W <= N, R <= N, W + R > N)\n",
+            N, W, R);
+        return 1;
+    }
+
     const std::string& node_id = listen;
     const int vnodes = std::stoi(vnodes_str);
     logEvent(EventType::NODE_INIT, node_id);
 
-    NodeServiceImpl service(node_id, vnodes);
+    NodeServiceImpl service(node_id, vnodes, N, W, R);
     grpc::ServerBuilder builder;
     builder.AddListeningPort(listen, grpc::InsecureServerCredentials());
     builder.RegisterService(&service);

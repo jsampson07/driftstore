@@ -12,7 +12,7 @@
 | 0 | Scaffolding + comparison harness skeleton | ✅ Done |
 | 1 | Gossip membership + local failure detection | ✅ Done |
 | 2 | Consistent hashing ring + virtual nodes | ✅ Done |
-| 3 | Any-node coordinator + basic quorum read/write | 🔄 In progress |
+| 3 | Any-node coordinator + basic quorum read/write | ✅ Done |
 | 4 | Vector clocks + conflict detection | ⬜ Not started |
 | 5 | Hinted handoff | ⬜ Not started |
 | 6 | Read-repair | ⬜ Not started |
@@ -971,10 +971,11 @@ empirical version of that already-documented tradeoff, not a new one.
 
 ---
 
-## Phase 3 — Any-node coordinator + basic quorum read/write (design locked, implementation starting)
+## Phase 3 — Any-node coordinator + basic quorum read/write (Done)
 
 Full design worked out in conversation before any code was written, same
-rule as Phase 2. Nothing below is implemented yet.
+rule as Phase 2. Design below is fully implemented as of this session,
+except where individual paragraphs still say otherwise.
 
 **Proto additions:** `Put`/`Get` (client-facing) and `ReplicateWrite`/
 `ReplicateRead` (coordinator-to-replica, internal) as four distinct RPCs
@@ -999,8 +1000,11 @@ while a bad `N`/`W`/`R` combination (`W=0`, or `W+R <= N`) would
 silently produce wrong-looking quorum behavior later — a write reporting
 success with no real durability guarantee, or a read that can never
 detect a stale replica — which is much harder to notice than a startup
-crash. **Decided, not yet implemented** — `main()` doesn't parse
-`--N=`/`--W=`/`--R=` yet.
+crash. **Implemented.** `main()` parses `--N=`/`--W=`/`--R=` (defaults `3`/`2`/`2`,
+the Dynamo paper's own running example) and validates at startup per the
+rules above, refusing to start otherwise. Not separately confirmed that the
+refusal path itself fires against a deliberately-invalid combination this
+session — only a valid config was exercised end-to-end.
 
 **Coordinator role is not tied to preference-list membership.** Any node
 can coordinate any key's request, but it's only *in* that key's
@@ -1244,12 +1248,18 @@ multiple vnodes gets re-rejected by the predicate once per vnode
 encountered in a single walk, instead of being remembered and skipped
 after the first rejection — accepted as bounded, wasted-but-not-incorrect
 work, since `visited >= ring.size()` still guarantees termination
-regardless of how many times any single candidate gets rejected. **Not
-yet confirmed:** the corresponding `test_ring.cpp` case (fabricated
-ring, a predicate excluding one node, confirming both the exclusion and
-that the three existing unrelated tests still pass against the new
-default-`true` parameter) was planned but not confirmed written or run
-as of this session.
+regardless of how many times any single candidate gets rejected.
+**Confirmed, Put/Get implementation session:** `test_ring.cpp`'s
+`testReachabilityPredicate()` covers two cases against a hand-built,
+non-hashed fabricated ring — (1) exclusion mid-walk, a predicate rejecting
+one physical node whose tokens are interleaved between two others',
+confirming the excluded node neither enters the result nor gets
+incorrectly marked `seen`; (2) short-list termination, a predicate
+admitting fewer than `N` reachable candidates even though `N`-or-more
+physical nodes exist — a materially different failure mode than the
+pre-existing "fewer than `N` distinct nodes exist at all" case. Both pass;
+the three pre-existing tests pass unmodified against the new default-`true`
+predicate parameter.
 
 **Probe thread — implemented.** `reachabilityRound()`/
 `reachabilityLoop()`, same loop-then-sleep shape as `gossipLoop`,
@@ -1329,6 +1339,11 @@ similar seam.
   parsing pattern as `--gossip-interval=`) and the updated call site.
   Compile-blocking, not a design question — first thing to check in a
   resumed session.
+  **Update, Put/Get implementation session:** the `service.start()` call
+  site itself was already correct — the actual bug was the
+  `--probe-interval=` flag parser assigning into an undeclared
+  `probe_interval_ms` instead of the real `reachability_interval_ms`
+  variable. Fixed; build confirmed clean.
 
 #### GTStore comparisons made this session
 
@@ -1351,31 +1366,316 @@ similar seam.
   its own, possibly-wrong, self-correcting opinion about who's currently
   reachable — there's no single authority to just ask instead.
 
+### Implementation session — N/W/R config, Put/Get coordinator handlers
+
+**`N`/`W`/`R` CLI flags + startup validation — implemented.** See the
+design-lock section above, now updated in place.
+
+**`Put`/`Get` coordinator handlers — implemented, manually verified.** Both
+follow the locked design: local write/read first if the coordinator is in
+the key's preference list (no self-RPC, counts toward the quorum), concurrent
+fan-out to the rest of the list via `std::async` (`ReplicateWrite`/
+`ReplicateRead`), launch-all-before-waiting-on-any, `isSelfRemoved()` guard
+first thing in both handlers — closes the gap where a removed coordinator
+could still route requests through still-live replicas even though it
+already refused to hold data itself (see `OPEN_QUESTIONS.md` Q16). `Put`
+counts acks in a `std::atomic<int64_t>` (a plain `int64_t` would race across
+concurrent fan-out tasks — see bugs below); success iff `acks >= W`, local
+write included. `Get` collects each replica's outcome into a shared,
+mutex-guarded vector, each stamped with an arrival-order sequence number at
+actual completion time, not launch order — sequence `0` is returned as the
+answer if `>= R` replicas responded. A responding replica that legitimately
+says "not found" is recorded as a valid response (keyed on `status.ok()`
+alone, regardless of `resp.found()`); only a non-responding replica is
+excluded from the count.
+
+**`client.cpp` — `--put=<key>=<value>` / `--get=<key>` added.** Same shape as
+the existing `--replicate-write=`/`--replicate-read=` flags, fronting
+`Put`/`Get` instead of the internal RPCs. `--put` exits nonzero on
+`success=false` (matching `--replicate-write`); `--get` always exits `0` on
+a completed RPC, since `found=false` is a legitimate answer, not a
+client-side failure (matching `--replicate-read`).
+
+**Manually verified, 3-node cluster:** a `Put`, then a `Get` issued against
+all 3 nodes individually, confirming every node returns the correct value.
+No automated harness yet — informal terminal verification only.
+
+#### GTStore comparisons made this session
+
+- **`N`/`W`/`R` config agreement has no GTStore analogue.** GTStore's `K`
+  lives in exactly one process — the manager — so "two nodes disagreeing
+  about `K`" isn't a risk GTStore ever had to design against; only one
+  process is ever capable of holding that value. Removing that single
+  authority doesn't just create the already-known cost of any node
+  computing a stale-but-eventually-correcting view of shared state (gossip
+  closes that gap on its own) — it can also create a sharper one: a value
+  with no shared-state mechanism backing it at all, trusted to agree by
+  convention rather than by any propagation path. See `OPEN_QUESTIONS.md`
+  Q19.
+- **The `acks` race condition is a bug category GTStore's model can't
+  produce.** GTStore's write-all/ack-all replication has no concurrent
+  fan-out with a shared counter being raced — every replica gets every
+  write, synchronously enough that there's no equivalent "multiple threads
+  incrementing one number" moment to get wrong. The race here is a direct
+  structural consequence of `W < N` sloppy quorum requiring concurrent
+  fan-out at all.
+
+#### Bugs caught during implementation (this session)
+
+- `Get`'s first draft called `ReplicateWrite`/`ReplicateWriteRequest`/
+  `ReplicateWriteResponse` — the wrong RPC entirely for a read path, a
+  copy-paste artifact from `Put`'s equivalent block.
+- `Get`: `const std::string val;` then reassigned — doesn't compile, and even
+  ignoring the `const`, `val` was a single scalar reused across every loop
+  iteration, discarding every prior peer's response — the real reason this
+  needed restructuring into a per-peer result collection, independent of the
+  sync-to-async conversion.
+- `Get`'s `GET_INIT` log line referenced the range-`for` loop's `peer_id`
+  before that loop existed — same undeclared-identifier shape as a bug
+  already caught once this phase (`markUnreachable`'s `node_id`/`peer_id`
+  mix-up) — recurred here in a new function, not a repeat of the same bug
+  site.
+- An intermediate `Get` draft moved `.get()` to run once per fan-out
+  iteration, immediately after each launch, rather than as its own pass
+  after every `std::async` call had already been issued — silently rebuilds
+  the fully sequential version underneath `std::async` syntax; total latency
+  becomes the sum of every replica's RPC time again, defeating the entire
+  reason for the concurrent fan-out.
+- An intermediate `Get` draft recorded a result only when
+  `status.ok() && resp.found()`, collapsing "replica responded and correctly
+  said not-found" into the same bucket as "replica never responded" — would
+  have made `results.size() >= R_` unable to distinguish a legitimate
+  quorum-of-not-found from an actual quorum failure.
+- `Get`'s final response unconditionally called `response->set_found(true)`
+  regardless of what the first-arrived result's `found` field actually said
+  — every read for a genuinely-missing key, once quorum was reached, would
+  have reported `found=true, value=""` to the client. The most severe bug
+  this session — a silent wrong answer, not a crash or a compile error, in
+  the code path most directly user-facing in this phase.
+- `Put`'s `ReplicateWriteRequest` never called `req.set_value(value)` —
+  `value` was captured in the lambda but never attached to the outgoing
+  request. Every remote replicated write would have stored an empty string
+  against the key, unconditionally, on every write with at least one remote
+  replica in the preference list.
+- `Put`'s `acks++` on a plain `int64_t`, incremented from multiple concurrent
+  `std::async` tasks with no lock and no atomic — a genuine data race
+  (read-modify-write, not a single instruction) that could silently
+  undercount real acks and fail a write that should have succeeded.
+- `Put`'s local write was never counted toward `acks` at all — `localPut`
+  happened, but only the remote fan-out's lambda incremented the counter, so
+  a coordinator that's also a replica for the key needed one more remote ack
+  than the design actually requires (`N=3, W=2`, coordinator in the list:
+  needs only 1 remote ack — local + 1 = `W` — but the draft required 2).
+  Overly conservative rather than silently wrong, but a real deviation from
+  "local write counts toward `W`."
+- `Put`'s remote-lambda check used `if (!resp.success)` — `success` is a
+  protobuf accessor method, needs `resp.success()`; same missing-`()` bug
+  class already logged twice this phase.
+- `Put`'s remote lambda had a bare `continue;` with no enclosing loop inside
+  the lambda body — doesn't compile; likely a copy-paste habit from writing
+  actual loops elsewhere in the same session.
+- `Put`'s `.get()` loop was missing a trailing semicolon.
+- `Put`'s two later `logEvent` calls used bare `PUT_FAILED`/`PUT_SUCCEEDED`
+  instead of `EventType::PUT_FAILED`/`EventType::PUT_SUCCEEDED` — `enum
+  class` deliberately doesn't leak members into the surrounding scope, so
+  this doesn't compile; the first `PUT_FAILED` call earlier in the same
+  function was already correctly qualified, so this was an inconsistency
+  within one function, not a repeated misunderstanding.
+- `PUT_INIT`/`PUT_SUCCEEDED`/`PUT_FAILED`/`GET_INIT`/`GET_SUCCEEDED`/
+  `GET_FAILED` didn't exist in `logging.hpp`'s `EventType` enum at all before
+  this session — needed adding to both the enum and the exhaustive
+  `toString()` switch, same two-spot pattern every prior event type has
+  followed.
+
+#### Known gaps carried forward, not yet closed
+
+- **No RPC deadline on the coordinator's internal fan-out.** `pingPeer` sets
+  a 500ms deadline on its `ClientContext`; the `ReplicateWrite`/
+  `ReplicateRead` calls inside `Put`/`Get`'s async lambdas don't. A replica
+  that hangs rather than cleanly refusing the connection would block that
+  `f.get()` — and therefore the whole coordinator call — indefinitely,
+  regardless of any deadline the client set on its call to the coordinator
+  (that only bounds the client-to-coordinator hop). Low risk against a clean
+  `kill -9` in manual testing so far; a real gap against Phase 8's fault
+  injection, which won't stay this clean.
+- **`Get` doesn't log a disagreement when replicas' values differ.** It
+  correctly picks the first-arrived response but never compares it against
+  the rest of the collected results — no signal yet when replicas actually
+  disagree, which the locked design calls for. Worth closing before Phase 6
+  (read-repair) needs to build on this.
+- **Several `logEvent` calls still concatenate `extra_kv` fields with no
+  separating space** (e.g. `"W=" + std::to_string(W_) + "preference_list_size="`
+  renders as `W=2preference_list_size=1` in the log line). Cosmetic, low
+  priority, not fixed this session.
+- **`Put`'s `pref_list.size() < W_` never got the `static_cast<int>(...)`
+  that `Get`'s equivalent check has** — inconsistent, not a functional bug
+  at current scale.
+- See `OPEN_QUESTIONS.md` Q19 (N/W/R config scope) and Q20 (arrival-order
+  tie-break) for two design questions surfaced this session that remain
+  genuinely open, not just undone.
+
 #### Not yet done — resume point for Phase 3
 
-- `main()`: add `--probe-interval=` flag, update `service.start(...)`
-  call to pass both intervals. Compile-blocking as of this session's
-  last code shown — check this first.
-- `ring.hpp`'s predicate change and the corresponding `test_ring.cpp`
-  case: written per description, not yet reviewed in chat, not yet
-  confirmed passing.
-- `N`/`W`/`R` CLI flags + startup validation (`N,W,R >= 1`, `W,R <= N`,
-  `W + R > N` — see the design-lock section above): decided, not
-  implemented.
-- `Put`/`Get` coordinator handlers (fan-out to `ReplicateWrite`/
-  `ReplicateRead`, quorum counting against `W`/`R`,
-  concurrent-launch-wait-for-all per the semantics locked above): not
-  started. Flagged throughout as worth designing/writing personally
-  rather than treating as boilerplate.
-- `REMOVED` guard on `Put`/`Get` themselves (a separate call site from
-  `ReplicateWrite`/`ReplicateRead`'s already-working guard): not
-  started.
-- `DriftClient` library (`connect(seed_nodes)` with fallback, `put`/
-  `get`): not started.
+- `DriftClient` library (`connect(seed_nodes)` with fallback, `put`/`get`):
+  not started.
 - End-to-end verification harness (3-node cluster, kill one, write with
   `W < N`, confirm success, confirm the coordinator's log line and the
-  killed replica's absence correlate): not started — natural next step
-  once `Put`/`Get` exist.
+  killed replica's absence correlate): not started — natural next step once
+  `DriftClient` exists to drive it properly.
+
+**Both resolved in the close-out session below.**
+
+#### Phase 3 close-out — DriftClient, coordinator-rotation harness, checkpoint review
+
+**`DriftClient` (`src/driftclient.hpp`):** a real, header-only class (not
+more CLI flags on `client.cpp`), matching this codebase's existing
+header-only convention (`ring.hpp`, `logging.hpp`). Deliberately exposes
+only `put(key, value)`/`get(key)` — never `ReplicateWrite`/`ReplicateRead`,
+which stay reachable only through `client.cpp`'s debug flags, so a real
+client can never bypass quorum the way `test_replica_boundary.sh`
+intentionally does to test the RPC boundary in isolation.
+
+- **`connect(seed_nodes)`:** eager — dials each seed once, in order,
+  verified via `Ping`, returns `std::nullopt` if none respond. No
+  retry/backoff, unlike `bootstrapFromSeed`: a client is assumed to connect
+  after the cluster is already up, so a single pass is enough. Return type
+  is `std::optional<DriftClient>`, matching the convention `SendGossip`
+  already established (Q8) rather than inventing a new success/failure
+  shape.
+- **Per-call coordinator selection: round-robin, not sticky.** Chosen
+  specifically because sticky would make every demo run show one node
+  coordinating everything until it happened to die — true to the
+  architecture but not observable as true. Rotation index is
+  `calls_made_ % seed_nodes_.size()`, incremented once per call regardless
+  of outcome. On a transport-level failure (`!status.ok()` — connection
+  refused/reset/deadline) for the seed selected that call, `DriftClient`
+  walks forward through the remaining seeds, wrapping once, **for that
+  call only**; the rotation counter itself isn't touched by a mid-call
+  failover, so one dead seed can't permanently skew future rotation onto
+  the survivors.
+- **Deliberately does NOT fail over on `success=false`** (e.g. a
+  self-`REMOVED` coordinator's refusal, vs. a genuine `W`/`R` quorum miss)
+  — see Q22 below for the full reasoning; this was a real design
+  discussion, not an oversight.
+
+**`src/driftclient.cpp`:** a thin CLI driver, not a general-purpose client
+— `--seeds=A,B,C --key=k --value=v [--calls=N]`, connects once, calls
+`put()` `N` times, prints one result line per call. Exists specifically so
+the harness below can drive `DriftClient` from bash and grep structured
+output, the same shape every other harness in this repo already uses.
+
+**Makefile bug found and fixed:** `bin/driftclient`'s recipe only compiled
+`src/driftstore.pb.cc`, silently omitting `src/driftstore.grpc.pb.cc` —
+copy-pasted from `test_ring`/`vnode_experiment`'s recipe, which is
+*correct* for those two (they only touch `ring.hpp`'s in-memory logic,
+never an actual RPC stub method) but doesn't generalize to
+`driftclient.cpp`, which calls `stub->Put`/`Ping`/`NewStub` for real. Failed
+at **link** time, not compile time — `undefined reference to
+driftstore::DriftStoreNode::Stub::Put(...)` and friends, plus the missing
+`Stub` vtable. Fixed by linking `$(PROTO_GEN)` (both generated files),
+matching `node`/`client`'s recipes. Confirmed via a live rebuild: fails
+exactly as described before the fix, links and runs clean after.
+Separately: `driftclient` is intentionally not a dependency of `all`,
+matching `test_ring`/`vnode_experiment`'s existing "dev tooling, build
+explicitly" pattern — `make bin/driftclient`.
+
+**`harness/test_coordinator_rotation.sh`:** 3-node cluster (`N=3 W=2 R=2`),
+kills node C **immediately** after gossip convergence — no wait for the
+`probe-interval` — so the coordinator/`DriftClient` must hit a live RPC
+failure against C, rather than have C pre-filtered out of the preference
+list by local reachability tracking. This is the sharper of the two
+possible timings and was chosen deliberately (see chat notes): it's the
+one that would actually expose a hang if the missing-RPC-deadline gap
+below ever mattered here (it doesn't, for a clean `kill -9` — the kernel's
+TCP RST makes the failure fast — but would for Phase 8's real partition
+simulation).
+
+Then issues 3 `put()` calls through one `DriftClient` (`seeds=[A,B,C]`).
+Rotation math: call 0 → A (direct), call 1 → B (direct), call 2 → C
+(dead, transport failure, wraps to A) — so A ends up coordinating calls 0
+*and* 2, B only call 1. All three must report `success=true`.
+
+**Log correlation, adjusted for a real design decision made this
+session:** `ReplicateWrite`/`ReplicateRead` are deliberately left
+unlogged (see Q23 — accepted log-clutter tradeoff, not a gap), so the
+harness does not check replica logs for write evidence. Instead it
+correlates against `Put`'s own log line, which now carries `key=`
+(already added independently this session — see below): node A's log
+must show exactly 2 `PUT_SUCCEEDED key=rotkey` lines, node B exactly 1,
+matching the rotation math above precisely — not just "the key appears
+somewhere," but which specific node coordinated which specific call.
+
+**Confirmed via a real, live run** — actual generated gRPC stubs from the
+real `.proto`, actual compiled `node`/`client`/`driftclient` binaries,
+actual `kill -9`, not a code-review approximation: **8/8 passing.**
+
+**`src/node.cpp`: `Put`/`Get`'s `PUT_SUCCEEDED`/`PUT_FAILED`/
+`GET_SUCCEEDED`/`GET_FAILED` now log `key=`** (added independently this
+session, ahead of the harness work above needing it). `ReplicateWrite`/
+`ReplicateRead` remain deliberately unlogged — an explicit, reasoned
+tradeoff against log clutter, not the gap it was first flagged as; see Q23.
+
+**Checkpoint — coordinator flow explained from memory, not from the
+code.** Overall shape confirmed correct: `isSelfRemoved()` check and its
+staleness-window rationale, preference-list computation via
+`preferenceListForKey`, self-write skipping the network round trip before
+fanning out to the rest. Two corrections surfaced, both substantive:
+
+- **`Put`'s ack-counting and `Get`'s response-counting are NOT the same
+  rule, and the first explanation given conflated them.** `Put`'s fan-out
+  lambda only increments `acks` on `status.ok() && resp.success()` — a
+  self-`REMOVED` replica's honest refusal does *not* count toward `W`.
+  `Get`'s fan-out lambda counts any `status.ok()` response toward `R`
+  regardless of `resp.found()`, because "not found" is a legitimate
+  answer from a live replica in a way "I refused your write" is not a
+  legitimate write ack. Worth being precise about, since Phases 4–6 all
+  build on `W`/`R` meaning something specific.
+- **"Wait for all responses or timed out" is not current behavior** —
+  neither `Put` nor `Get`'s internal `ReplicateWrite`/`ReplicateRead`
+  calls set an RPC deadline. Invisible against a clean `kill -9` (fast
+  TCP RST), genuinely unbounded against a hung/black-holed peer. Already
+  a known gap before this session; re-flagged here specifically because
+  it had drifted into "already handled" in the mental model being
+  checked — see Q21, promoted to a tracked question ahead of Phase 8.
+
+**Q20 sharpened, not resolved:** self's `arrival_order=0` in `Get` is a
+**structural guarantee**, not a probabilistic tendency toward winning —
+it's assigned synchronously, before any remote `std::async` future is
+even launched, so no remote reply could beat it even hypothetically.
+Moving the self-check into the general loop (the fix direction proposed
+in the checkpoint) is necessary but not sufficient on its own — local
+would also need to be dispatched via `std::async` alongside the remote
+calls to genuinely race in real time. Q20 itself remains open, not
+blocking.
+
+#### GTStore comparison made this session
+
+**`DriftClient`'s `connect(seed_nodes)` is what actually closes the gap
+Phase 0's own comparison note overclaimed.** That note reads: *"Driftstore's
+client has no equivalent [SPOF] step; it just dials an address directly."*
+True of the *privileged-role* SPOF (no manager), not true of the
+*single-address-to-dial* SPOF — until this session, `client.cpp` still
+required one specific `--target` address, and failed cleanly if that one
+node was down, functionally identical to GTStore's client failing when
+its one manager address was down. `DriftClient` is the mechanism that
+makes the original comparison true rather than aspirational. Also
+clarified as a separate point, prompted by "is the client now a node?":
+the client/server boundary and the AP/CP axis are orthogonal — "any node
+can coordinate" is a statement about server-side symmetry, not a
+statement that collapses the client/server split, and GTStore never
+merged `test_app` into `storage` either. Inverting AP/CP was this
+project's goal; the client/server boundary was never in scope to invert.
+
+#### Known gaps carried forward into Phase 8 / backlog
+
+- No RPC deadline on the coordinator's internal `Put`/`Get` fan-out — see
+  Q21.
+- Q16 (self-`REMOVED` coordinator refusing `Put`/`Get`) is implemented but
+  still not verified by an equivalent test to `test_replica_boundary.sh`'s
+  `ReplicateWrite`/`ReplicateRead` coverage — accepted as debt at Phase 3
+  close, same pattern as Q17's two accepted gaps at Phase 2 close.
+- Cosmetic logging/casting inconsistencies noted during the earlier Put/Get
+  session remain unfixed, still low priority.
 
 ---
 

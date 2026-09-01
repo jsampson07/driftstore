@@ -191,6 +191,143 @@ just because it's easy.
 
 *Context:* raised during the probe thread design/implementation session.
 
+### Q19 — Should N/W/R be enforced system-wide, or admin-declared per-node by convention only?
+Surfaced while starting `Put`/`Get`'s design: `N`/`W`/`R` are node-level CLI
+flags, identical in delivery mechanism to `--vnodes`. But `--vnodes`
+transfers safely because the thing it configures — the ring — is
+synchronized ground truth: whatever tokens a node actually claims get
+gossiped, and every node's ring converges to agreement regardless of what
+value any individual node was launched with. `N`/`W`/`R` have no equivalent
+mechanism. Nothing gossips them, nothing reconciles them; each process just
+holds whatever its own launch flags said. Two distinct problems follow from
+this, not one: (1) different `N` across coordinators isn't a strictness
+difference on the same replica set, it's a different replica set entirely
+for the same key — `preferenceListForKey(key, N)` returns physically
+different nodes depending on which coordinator computed it; (2) even with
+matching `N`, `W + R > N`'s overlap guarantee is a claim about the whole
+system, not a per-coordinator setting — a write coordinated under one
+node's locally-configured `W` and a read coordinated under another node's
+locally-configured `R` have no guaranteed overlap unless every node is
+actually enforcing the same values, which nothing currently confirms or
+requires.
+
+Two directions considered, neither implemented:
+- **(A) Admin-declared, uniform by convention only.** Keep the CLI flags;
+  the contract becomes "every node in the cluster must be launched with
+  identical `N`/`W`/`R`," enforced by operational discipline (harness
+  scripts), not by the system. Cheapest, and has real precedent in this
+  project: Q13 already accepted the same category of risk deliberately for
+  the seed list (static, admin-declared, no runtime reconciliation,
+  Cassandra's `seeds` config as precedent). Matches how the Dynamo paper
+  itself describes `N`/`R`/`W` as configured "per instance." Leaves a real
+  gap: nothing detects a misconfigured node — worse here than for seeds,
+  since Phase 8's fault-injection harness will be scripting node restarts,
+  exactly where a flag typo could silently corrupt correctness with no
+  signal.
+- **(B) Gossip `N`/`W`/`R` (or at minimum `N`) as part of membership,
+  detect/refuse on mismatch.** Closes the silent-misconfiguration gap. Real
+  new complexity: a new gossiped field, and an undecided question about
+  what a node should do on startup if its own config disagrees with what it
+  learns from peers (refuse to start? defer to the cluster's value? which
+  value wins on a tie, mirroring the question `mergeInto` already answers
+  for `NodeStatus`?).
+
+*Status:* unresolved — currently running as (A) by default, without ever
+having explicitly chosen it; `Put`/`Get` shipped with node-level `N`/`W`/`R`
+flags before this question was written down. Worth a deliberate decision
+before Phase 8's fault injection starts exercising restart/reconfiguration
+scenarios where a silent mismatch would actually bite.
+*Context:* raised while designing `Put`/`Get`, before either handler was
+implemented — see `PROGRESS.md`'s Phase 3 implementation session for the
+full comparison against `--vnodes` and against GTStore's single-process `K`.
+
+### Q20 — Should a coordinator's own local read winning arrival-order ties be an explicit policy, or just an accepted side effect?
+`Get`'s first-arrived-response selection stamps the coordinator's own local
+read (when it's in the preference list) with sequence `0` unconditionally,
+because it happens synchronously, before any remote `ReplicateRead` is even
+launched — not because of any comparison against real completion times. So
+whenever the coordinator holds a replica for the key, its own local value
+always wins a disagreement, regardless of whether some other replica's RPC
+would genuinely have completed first. This fell directly out of "local
+first, no self-RPC" — a decision framed entirely around avoiding a loopback
+RPC and giving the local write credit toward `W`/`R` — not out of any
+decision about how ties should resolve when replicas disagree.
+
+*Status:* unresolved, not blocking — surfaced while reviewing the completed
+`Get` handler, not acted on. Worth deciding explicitly whether this is
+acceptable (the coordinator's own copy is *a* valid replica's answer, no
+more or less legitimate than any other single reply under the current naive
+first-arrived floor) or worth changing, especially once Phase 6's
+read-repair starts caring about which replica's value systematically wins.
+*Context:* raised while reviewing the `Get` coordinator handler, Phase 3
+implementation session.
+
+**Update, Phase 3 checkpoint session:** sharpened, not resolved. Self's
+`arrival_order=0` is a **structural guarantee**, not a probabilistic
+tendency — it's assigned synchronously, before any remote `std::async`
+future is even launched, so no remote reply could beat it even
+hypothetically, regardless of real network speed. Also: moving the
+self-check textually into the general loop (one candidate fix) is
+necessary but not sufficient by itself — local would still resolve
+before any remote call unless it's *also* dispatched via `std::async` to
+genuinely race in real time. Still open either way.
+
+### Q21 — No RPC deadline on the coordinator's internal `Put`/`Get` fan-out
+Neither `Put` nor `Get`'s internal `ReplicateWrite`/`ReplicateRead` calls
+(the ones issued from inside the `std::async` fan-out lambdas) ever set a
+deadline on their `grpc::ClientContext`, unlike `pingPeer`'s 500ms
+deadline. Invisible against a clean `kill -9` — the kernel sends a TCP
+RST immediately, so the call fails fast and looks bounded. Genuinely
+unbounded against a peer that's unresponsive without cleanly closing the
+connection (packet black-holed, not killed) — `f.get()` blocks forever,
+and so does the entire coordinator call, regardless of any deadline the
+client set talking to the coordinator itself.
+
+*Status:* unresolved — originally logged as a known gap in `PROGRESS.md`
+during the Put/Get implementation session, promoted to a tracked question
+here after resurfacing, unprompted, during the Phase 3 checkpoint
+self-explanation session (the coordinator flow was described as "bounded
+by the slowest node," which isn't accurate yet). Low risk against
+`kill -9`-style fault injection; a real gap against Phase 8's actual
+partition simulation, which won't fail this cleanly.
+*Context:* raised during the Put/Get implementation session; reconfirmed
+during the Phase 3 checkpoint session.
+
+### Q22 — Should `DriftClient` fail over on a `success=false` response, not just a transport failure?
+Two scenarios make this concrete. (1) A seed in `DriftClient`'s list has
+since been administratively `REMOVED` — its `Put` handler returns
+`success=false` immediately, before touching the ring at all; failing
+over to a different seed would very likely succeed. (2) A seed is a
+perfectly valid coordinator, but two of the three replicas for the key
+happen to be down — it returns `success=false, acks=1` (`W=2`), a
+genuine fact about the world; failing over to a different seed would hit
+the *same* replica set (`preferenceListForKey` depends only on the key
+and the ring, not on who's coordinating) and get the same answer, at the
+cost of a second full fan-out. `PutResponse`/`GetResponse` currently give
+no way to tell these two cases apart — no `reason` field, same
+`grpc::Status::OK` either way — so `DriftClient` can't write different
+code for each.
+
+Two directions: **(A)** only fail over on transport-level failure
+(`!status.ok()`), accept that a stale/removed seed entry just fails
+cleanly until the seed list is updated by hand. **(B)** extend the proto
+with a distinguishable reason/status so the two cases can actually be
+told apart, and only fail over on the first.
+
+**Resolution: (A), for now.** Not chosen as a compromise — the concrete
+harness this was designed against (`kill -9` mid-run) never exercises
+this ambiguity at all, since that failure shows up as a transport
+failure, which Option A already handles with zero compromise. The
+scenario that *does* need the distinction — a long-lived `DriftClient`
+still holding a since-removed seed — isn't in any harness or demo
+currently planned; building (B) now would be solving it on spec, the
+same category of thing Q13 already declined to do for seed discovery.
+Revisit if a concrete scenario actually needs it, same as Q13.
+
+*Context:* raised while designing `DriftClient`'s failover semantics,
+Phase 3 close-out session.
+*Resolved during:* same session.
+
 ---
 
 ## Resolved
@@ -468,3 +605,40 @@ removal), not just a missing key — proving the guard actually fires
 rather than merely proving the key's absence. `Put`/`Get`'s equivalent
 guard (a separate call site from `ReplicateWrite`/`ReplicateRead`'s) is
 still pending, since `Put`/`Get` themselves don't exist yet.
+
+**Update, Put/Get implementation session:** `isSelfRemoved()` now also
+guards `Put` and `Get`, closing the gap this file's previous update left
+open. Unlike `ReplicateWrite`/`ReplicateRead`'s guard — verified by
+`harness/test_replica_boundary.sh` against a replica that demonstrably
+already held the key — `Put`/`Get`'s guard has not yet been verified by an
+equivalent test; this session's manual verification exercised only the
+non-removed path (a healthy 3-node cluster, `Put` then `Get` from all
+three). Confirming a removed coordinator actually refuses `Put`/`Get`
+remains undone.
+
+**Update, Phase 3 close-out session:** still undone — carried forward as
+accepted debt at Phase 3 close, same treatment as Q17's two accepted gaps
+at Phase 2 close, rather than blocking the phase on it.
+
+### Q23 — Should `ReplicateWrite`/`ReplicateRead` log anything, given `Put`/`Get` already do?
+Raised when a harness assertion expected replica-side log evidence
+(`grep`-ing for a key in a replica's log after a coordinated write) and
+found none — `ReplicateWrite`/`ReplicateRead` have zero `logEvent` calls,
+success or failure, unlike every other RPC in this codebase.
+
+**Resolution: intentional, not a gap.** Logging every internal
+replication call in addition to `Put`/`Get`'s own success/failure lines
+was judged to add clutter without adding signal that `Put`/`Get`'s
+already-`key=`-bearing lines don't provide — the coordinator's own log
+line is sufficient to confirm a write happened and roughly how many
+replicas acked it. The harness that surfaced this
+(`test_coordinator_rotation.sh`) was rewritten to correlate against
+`Put`'s log line instead (counting `PUT_SUCCEEDED key=<k>` occurrences
+per node, which also happens to prove *which* node coordinated *which*
+call — a stronger check than replica-log presence would have given
+anyway).
+
+*Context:* raised during the Phase 3 close-out harness session, prompted
+by a failing assertion that turned out to be checking for something
+deliberately absent, not something broken.
+*Resolved during:* same session.

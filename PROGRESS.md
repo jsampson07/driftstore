@@ -1,10 +1,5 @@
 # Driftstore — Progress Log
 
-> Paste this file into this Claude Project's context to preserve continuity
-> across conversations. Update it at the end of each phase, or sooner if a
-> significant decision gets made. Claude will propose updates as phases wrap;
-> apply them here and in the repo.
-
 ## Phase status
 
 | Phase | Description | Status |

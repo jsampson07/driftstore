@@ -4,7 +4,7 @@ A leaderless, gossip-coordinated key-value store in C++17 / gRPC. Any node can c
 
 ## Why this exists
 
-I built [GTStore](https://github.com/jsampson07/DistributedSystems/tree/main/gtstore) first: a sharded, replicated KV store with a centralized manager, static modulo hashing, and a client that wrote directly to all `K` replicas. It worked. It also left a specific question. Systems like Cassandra and DynamoDB reject almost every one of those choices — no manager, no fixed node count, no client-side fan-out, no "block until every replica agrees." I understood that tradeoff from a textbook. I had not built the AP side of it, so I could not say what it actually costs.
+I built [GTStore](https://github.com/jsampson07/distributed_gtstore) first: a sharded, replicated KV store with a centralized manager, static modulo hashing, and a client that wrote directly to all `K` replicas. It worked. It also left a specific question. Systems like Cassandra and DynamoDB reject almost every one of those choices — no manager, no fixed node count, no client-side fan-out, no "block until every replica agrees." I understood that tradeoff from a textbook. I had not built the AP side of it, so I could not say what it actually costs.
 
 Driftstore is the same storage problem with those decisions inverted: gossip instead of centralized heartbeats, consistent hashing instead of modulo, sloppy quorum instead of write-all. The point is not to clone Cassandra. It is to be able to point at a mechanism and say what it buys and what it costs, having built the problem twice.
 

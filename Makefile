@@ -43,5 +43,12 @@ $(BIN_DIR)/vnode_experiment: src/vnode_experiment.cpp src/ring.hpp $(PROTO_GEN)
 	mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) src/vnode_experiment.cpp src/driftstore.pb.cc $(LFLAGS) -o $(BIN_DIR)/vnode_experiment
 
+# driftclient.cpp makes real RPC calls (Stub::Put/Ping, NewStub), unlike
+# test_ring/vnode_experiment above — needs the grpc-generated .cc linked in
+# too, not just the plain protobuf one, or it fails at link time.
+$(BIN_DIR)/driftclient: src/driftclient.cpp src/driftclient.hpp $(PROTO_GEN)
+	mkdir -p $(BIN_DIR)
+	$(CC) $(CFLAGS) src/driftclient.cpp $(PROTO_GEN) $(LFLAGS) -o $(BIN_DIR)/driftclient
+
 clean:
 	$(RM) src/*.pb.cc src/*.pb.h $(BIN_DIR)/*

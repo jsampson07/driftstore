@@ -12,7 +12,7 @@ Driftstore is the same storage problem with those decisions inverted: gossip ins
 
 ## GTStore vs. Driftstore
 
-GTStore is a sibling project: [`jsampson07/DistributedSystems/gtstore`](https://github.com/jsampson07/DistributedSystems/tree/main/gtstore). Same language, same RPC stack, opposite architecture.
+GTStore is a sibling project: [`jsampson07/DistributedSystems/gtstore`](https://github.com/jsampson07/distributed_gtstore). Same language, same RPC stack, opposite architecture.
 
 | Dimension | GTStore | Driftstore |
 |---|---|---|

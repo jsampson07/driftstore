@@ -21,12 +21,6 @@
 
 namespace {
 
-    int64_t nowMillis() {
-        return std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()
-        ).count();
-    }
-
     // permanent now — backs GetStatus. Sorted by node_id so output is
     // diffable across nodes when comparing status calls by hand.
     std::string dumpTable(const driftstore::MembershipTable& table) {

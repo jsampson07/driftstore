@@ -7,6 +7,11 @@ enum NodeStatus {
     REMOVED = 1;
 }
 
+enum WriteOutcome {
+    STORED = 0;
+    ALREADY_CURRENT = 1;
+}
+
 message MembershipEntry {
     string writer_id = 1;
     string address = 2;
@@ -17,6 +22,11 @@ message MembershipEntry {
 
 message MembershipTable {
     map<string, MembershipEntry> entries = 1;
+}
+
+message VectorClock {
+    map<string, uint64> clocks = 1; // <node_id, node's counter for the key>
+    int64 last_updated = 2; // per LWW input only (stamped by the coordinating node)
 }
 
 service DriftStoreNode {
@@ -33,11 +43,13 @@ service DriftStoreNode {
 message PutRequest {
     string key = 1;
     string value = 2;
+    VectorClock context = 3; // this is optional: abset means blind write
 }
 
 message PutResponse {
     bool success = 1; // this is only on if acks >= W
     int32 acks = 2; // how many replicas succeeded ( >= W )
+    VectorClock context = 3;
 }
 
 message GetRequest {
@@ -48,15 +60,18 @@ message GetResponse {
     bool found = 1;
     string value = 2;
     int32 responses = 3; // number of replicas answered ( >= R )
+    VectorClock context = 4;
 }
 
 message ReplicateWriteRequest {
     string key = 1;
     string value = 2;
+    VectorClock vector_clock = 3;
 }
 
 message ReplicateWriteResponse {
     bool success = 1;
+    WriteOutcome outcome = 2; // observability ONLY
 }
 
 message ReplicateReadRequest {
@@ -66,6 +81,7 @@ message ReplicateReadRequest {
 message ReplicateReadResponse {
     bool found = 1;
     string value = 2;
+    VectorClock vector_clock = 3;
 }
 
 message PingRequest {

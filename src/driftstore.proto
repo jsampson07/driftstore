@@ -27,6 +27,7 @@ message MembershipTable {
 message VectorClock {
     map<string, uint64> counters = 1; // <node_id, node's counter for the key>
     int64 last_updated = 2; // per LWW input only (stamped by the coordinating node)
+    string writer_id = 3;
 }
 
 service DriftStoreNode {

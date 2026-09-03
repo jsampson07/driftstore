@@ -261,10 +261,13 @@ inline std::vector<VersionedValue> computeFrontier(const std::vector<VersionedVa
 // from each replica that responded — the single VersionedValue this
 // returns is what goes into GetResponse (value + the clock the client
 // should cache as its next context, per decision D3).
-inline const VersionedValue& resolveGetResult(const std::vector<VersionedValue>& replica_responses) {
+inline VersionedValue resolveGetResult(const std::vector<VersionedValue>& replica_responses) {
     // TODO: compose computeFrontier + resolveLWW. Decide what happens on
     // an empty input (shouldn't reach here if Get already checked
     // responses.size() >= R before calling this, but don't assume — guard
     // it explicitly).
-    throw std::logic_error("resolveGetResult: not yet implemented");
+    assert(!replica_responses.empty());
+    std::vector<VersionedValue> frontier = computeFrontier(replica_responses);
+    if (frontier.size() > 1) return resolveLWW(frontier);
+    return std::move(frontier[0]);
 }

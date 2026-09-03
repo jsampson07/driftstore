@@ -182,6 +182,7 @@ inline driftstore::VectorClock buildNewClock(
     driftstore::VectorClock merged = mergeClocks(client_context.value_or(driftstore::VectorClock()), local_copy.value_or(driftstore::VectorClock()));
     (*merged.mutable_counters())[coordinator_node_id] += 1;
     merged.set_last_updated(nowMillis());
+    merged.set_writer_id(coordinator_node_id);
     return merged;
 }
 
@@ -196,9 +197,24 @@ inline driftstore::VectorClock buildNewClock(
 // decision hiding as a default, not a real tiebreak.
 inline const VersionedValue& resolveLWW(const std::vector<VersionedValue>& concurrent_versions) {
     // TODO: pick the entry with the highest clock.last_updated().
-    // Precondition you can assume but should still assert/check in debug
-    // builds: concurrent_versions is non-empty.
-    throw std::logic_error("resolveLWW: not yet implemented");
+    // Precondition you can assume but should still assert/check in
+    // debug builds: concurrent_versions is non-empty.
+    // If curr winner ever wins or ties, then winner stays the same. Why?
+    // In tiebreaker of writer_id, winner has come first and that is the second tiebreaker.
+    // In winner > candidate timestamp, winner wins.
+    // If candidate ever wins, then we want winner to now be candidate.
+    assert(!concurrent_versions.empty());
+    const VersionedValue* winner = &concurrent_versions[0];
+    for (size_t i = 1; i < concurrent_versions.size(); ++i) {
+        const auto& candidate = concurrent_versions[i];
+        if (candidate.clock.last_updated() > winner->clock.last_updated()) {
+            winner = &candidate;
+        } else if (candidate.clock.last_updated() == winner->clock.last_updated() &&
+                    candidate.clock.writer_id() > winner->clock.writer_id()) {
+            winner = &candidate;
+        }
+    }
+    return *winner;
 }
 
 // Decision D1: reduces a set of (value, vector_clock) pairs collected from
@@ -215,7 +231,25 @@ inline std::vector<VersionedValue> computeFrontier(const std::vector<VersionedVa
     // TODO: for each candidate, check whether any other candidate in the
     // list DOMINATES it (or EQUALs it and you've already kept one copy —
     // decide how you want to dedupe true duplicates). Keep only survivors.
-    throw std::logic_error("computeFrontier: not yet implemented");
+    std::vector<VersionedValue> survivors;
+    for(size_t i = 0; i < replica_responses.size(); ++i) {
+        bool keep = true;
+        for (size_t j = 0; j < replica_responses.size(); ++j) {
+            if (i == j) continue;
+            ClockComparison res = compareVectorClocks(replica_responses[i].clock, replica_responses[j].clock);
+            if ((res == ClockComparison::EQUAL) && (j < i)) { // if dupicate of an entry before (can skip because logic already applied to first occurrence entry)
+                keep = false;
+                break;
+            } else if (res == ClockComparison::DOMINATED) {
+                keep = false;
+                break;
+            }
+            // DOMINATES: no action - i beats j, keep i until find otherwise or done
+            // CONCURRENT: no action - genuine conflict, resort to resolveLWW after
+        }
+        if (keep) survivors.push_back(replica_responses[i]);
+    }
+    return survivors;
 }
 
 // Decision D1, the function that actually replaces Get's old

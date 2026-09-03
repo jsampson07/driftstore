@@ -4,3 +4,4 @@ src/*.pb.h
 src/*.grpc.pb.cc
 src/*.grpc.pb.h
 *.log
+ARCHITECTURE.md

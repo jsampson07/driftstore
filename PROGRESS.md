@@ -1,5 +1,10 @@
 # Driftstore — Progress Log
 
+> Paste this file into this Claude Project's context to preserve continuity
+> across conversations. Update it at the end of each phase, or sooner if a
+> significant decision gets made. Claude will propose updates as phases wrap;
+> apply them here and in the repo.
+
 ## Phase status
 
 | Phase | Description | Status |
@@ -8,7 +13,7 @@
 | 1 | Gossip membership + local failure detection | ✅ Done |
 | 2 | Consistent hashing ring + virtual nodes | ✅ Done |
 | 3 | Any-node coordinator + basic quorum read/write | ✅ Done |
-| 4 | Vector clocks + conflict detection | ⬜ Not started |
+| 4 | Vector clocks + conflict detection | ⬜ Design decided, implementation in progress — branch 2/9 merged |
 | 5 | Hinted handoff | ⬜ Not started |
 | 6 | Read-repair | ⬜ Not started |
 | 7 | Dashboard | ⬜ Not started |
@@ -133,6 +138,15 @@ different nodes' status calls. `GetStatus` snapshots `table_` under
 a human debugging tool for now — deliberately not shaped as a machine-facing
 endpoint (no plan yet to have the fault-injection or comparison harness call
 it programmatically; revisit if that changes).
+
+**Update, Phase 4 branch 2 session:** `nowMillis()` relocated out of this
+anonymous namespace into `logging.hpp`, since `vector_clock.hpp`'s
+`buildNewClock` (Phase 4) needs the same wall-clock-millis stamp
+`node.cpp` already used for `MembershipEntry.last_updated`, and
+`vector_clock.hpp` can't reach a symbol with internal linkage that's
+private to `node.cpp`'s translation unit. `dumpTable()` itself did not
+move — only `nowMillis()`. Full reasoning and the linkage constraint that
+motivated it are in Phase 4's branch 2 close-out, below.
 
 **`client.cpp` `--status` mode:** new flag, mutually exclusive with `--self`
 (a status query has no `sender_node_id` to populate). Prints
@@ -1671,6 +1685,541 @@ project's goal; the client/server boundary was never in scope to invert.
   close, same pattern as Q17's two accepted gaps at Phase 2 close.
 - Cosmetic logging/casting inconsistencies noted during the earlier Put/Get
   session remain unfixed, still low priority.
+
+---
+
+## Phase 4 — Vector clocks + conflict detection (design decided; implementation in progress — branch 2/9 merged)
+
+Design conversation followed by staged implementation across nine
+git branches, treated as sequential checkpoints (branch → PR → merge to
+main → pull → next branch). Per this project's own workflow rule, the
+correctness-critical pieces below (clock construction, comparison, the
+atomic critical section) were designed and reasoned through by the project
+owner before Cursor or Claude wrote any of it — the design session produced
+the decisions below; the roadmap immediately after tracks implementation
+status branch by branch.
+
+### What Phase 4 replaces in existing code
+`Get`'s current answer-selection (arrival-order wins, coordinator's local
+copy structurally guaranteed to win via `arrival_order=0` — see Q20) has no
+mechanism for detecting that two replicas actually disagree; it just races
+responses and returns one. Phase 4's comparison logic is what makes that
+detection possible for the first time. Q20 is effectively superseded by this
+phase's design, not resolved by it — `Get`'s selection logic is being
+replaced wholesale, not patched.
+
+### Decision A1 — Clock construction on `Put`
+Coordinator merges (component-wise max) the client-supplied context *and*
+its own local copy of the key (if it holds one as a replica), then
+increments its own axis on top of the merged result.
+
+**Why:** the two sources cover opposite failure directions. Local-copy-merge
+catches the case where the coordinator's own knowledge is ahead of the
+client's context (client stale) — proven by construction: a clock built by
+incrementing a coordinator's own axis on top of *any* real ancestor clock
+can never come out dominated by a version that predates it, so self-merging
+in local knowledge cannot itself cause a false "dominates." Client-context
+catches the opposite case — `DriftClient`'s round-robin coordinator
+selection means a client can `get()` through one node and `put()` through
+another that hasn't yet gossiped/replicated in the version the client just
+read; without the client's context, that coordinator's local-only merge
+would build off its own stale view and misclassify a genuinely sequential,
+informed write as merely "concurrent," pushing it into the LWW tiebreak for
+no real reason. Neither source alone covers both directions.
+
+**Rejected:** a coordinator-local monotonic counter, incremented
+independently of anything read — produces false dominance and silent
+overwrites (walked through concretely in-session: coordinator locally at
+`[(A,1),(X,3)]`, stale context `[(A,1)]`, blind increment on context alone
+produces `[(A,1),(X,1)]`, which the coordinator's own current state
+dominates — the fresh write is misclassified as an ancestor and silently
+dropped). Local-copy-only (no client context) was seriously considered and
+is provably safe against silent data loss, but leaves the round-robin case
+above unaddressed — accepted as a real, structurally frequent cost given how
+`DriftClient` is built, which is why client context was added on top rather
+than treated as an optional nicety.
+
+### Decision A2 — Wire shape
+`put()` gains an optional context parameter; `get()` returns context
+alongside the value; `DriftClient` holds and round-trips it between calls.
+A `put()` arriving with no context (first-ever write, or a caller that
+skipped `get()`) is treated as empty context, not rejected — falls back to
+local-copy-only merge, same behavior Phase 3 already has. Availability is
+unaffected either way; context is additive information when present, never
+a requirement for the write to proceed.
+
+**Why:** direct consequence of A1 needing the client's observed context as
+an input the coordinator can't otherwise reconstruct.
+**Tradeoff accepted:** real API-surface change, the one the original plan
+flagged as the "changes the client API shape" fork. Judged worth it once
+A1's analysis showed local-copy-only lets a client's genuinely fresher
+knowledge go to waste on every round-robin-induced coordinator handoff.
+
+**Follow-up decision, settled during proto work:** `PutResponse` also
+returns `context` (the resulting clock), not just `GetResponse` — a client
+that only ever refreshed its cached context via `get()` would be more
+likely to carry stale context into its *next* `put()` for no reason, given
+`buildNewClock` runs exactly once per `Put` regardless of outcome and
+therefore always has a clock to return. Safe to cache even from a partial
+(`acks < W`) response — per A1/A2, context can only ever be honestly stale,
+never wrong about causality, so returning it unconditionally doesn't risk
+misrepresenting anything.
+
+### Decision B1 — Equal-clock case
+No distinct comparison-logic branch needed for equal clocks with equal
+values — that combination only arises from the same logical write appearing
+twice (e.g. a retry). Correctness instead depends on a precondition:
+the read → merge → increment → store sequence at a coordinator must execute
+as one atomic critical section per key, using the existing `kv_store_mutex_`
+widened to cover the whole sequence rather than just the final store.
+
+**Why this matters, precisely:** without that widened lock, two genuinely
+*different* concurrent `Put`s landing on the *same coordinator*, for the
+*same key*, could race — both read the same stale base before either writes
+back, and both independently compute the identical incremented clock for
+two different values. That's a real correctness bug (silent collision, no
+conflict ever detected, one write vanishes with nothing to indicate why),
+not a tiebreak decision — comparison logic never even gets the chance to
+see the two writes as different. This is a narrow, purely local race (same
+coordinator, same key, same instant) — it does not touch or limit
+vector-clock-concurrent writes across *different* coordinators, which
+remain fully detectable; the lock only prevents the degenerate case that
+would blind detection at a single coordinator.
+**No new lock introduced** — same mutex Phase 3 already uses for
+`localPut`/`localGet`, sub-microsecond hold time, no network I/O inside it.
+
+### Decision B2 — LWW tiebreak timestamp placement
+Lives inside each version's own vector clock message as `last_updated`,
+stamped once by whichever node coordinates that specific write. A later
+node resolving a conflict reads existing timestamps; it never generates a
+new one for a version it didn't write.
+
+**Why:** mirrors the precedent gossip's `mergeInto` already set (Q1) — same
+LWW-on-stored-timestamp shape, no reason to diverge.
+**Deferred, not decided (tracked as Q24):** an exact-timestamp-tie
+tiebreak. Two genuinely concurrent writes could plausibly tie at
+millisecond resolution — not the B1 race (that's identical clocks from one
+write echoed twice), this is two *different* clocks whose LWW timestamps
+happen to collide. Q1 has a `writer_id` tiebreak for the equivalent case at
+the membership layer; Phase 4 doesn't have an equivalent yet.
+
+**Update, branch 2 implementation session: Q24 resolved.** `VectorClock`
+gained a `writer_id` field; `resolveLWW` tiebreaks `last_updated` first,
+`writer_id` second. The originally-assumed justification for reaching for
+`writer_id` at all — that two genuinely `CONCURRENT` entries can never
+share a `writer_id` — turned out to be false in one real case (a
+non-replica coordinator's contributed axis depends entirely on
+caller-supplied context, not any persisted local state) and was corrected
+during design rather than shipped as stated. Full write-up, including the
+counterexample, in `OPEN_QUESTIONS.md`'s Resolved section and this file's
+Branch 2 close-out below.
+
+### Decision B3 — Wall-clock skew risk on the tiebreak
+Accepted as-is, same treatment Q1 already gave gossip's `last_updated`.
+Not solved; tracked as Q25. Concrete failure case discussed in-session: a
+causally-later write (proven by vector-clock dominance, not by timestamp)
+coordinated by a node whose clock runs slow relative to the peer that
+coordinated the causally-earlier write could, if this component were
+somehow bypassed, be misordered by a pure-timestamp scheme — this is
+exactly why LWW is scoped to only the genuinely-concurrent residual case
+(where no causal signal exists at all) rather than applied as the primary
+resolution mechanism; dominance comparison is immune to clock skew by
+construction and is always checked first.
+
+### Decision C1 — Where resolution happens
+Coordinator resolves a detected conflict once (merge, compare, apply LWW if
+concurrent) and broadcasts the single resolved `(value, vector_clock)` to
+all replicas via `ReplicateWrite`. Additionally: `ReplicateWrite`'s handler
+on the replica side gets a defensive dominance check against its own
+current copy before overwriting — not distrust of the coordinator, but a
+guard against the replica having independently already received a newer
+write (via some other coordinator) that this coordinator structurally
+cannot know about yet, given W<N and asynchronous replication.
+
+**Rejected:** per-replica independent resolution on receipt — risks
+different replicas landing on different winners given replica histories can
+already differ (a real possibility given W<N), which breaks convergence
+outright rather than merely delaying it.
+**Structural limit named explicitly, not treated as a gap:** coordinator-side
+resolution can only account for conflicts the coordinator can actually see.
+It cannot detect a conflict with a write some other, currently-unaware
+coordinator just accepted elsewhere — that information isn't co-located
+yet. This is exactly the case D1 below hands to `Get`, not to any
+write-time mechanism.
+
+**Finalized during proto work — semantics of the defensive check:** the
+replica's existing copy *dominating* the incoming write is not a failure —
+it means the replica turned out to be more current than the coordinator
+was, so the coordinator's own resolved value was the stale one.
+`ReplicateWriteResponse.success` therefore keeps its existing, unrelated
+meaning (`false` only on the Q16 self-removed refusal); a new `WriteOutcome`
+enum (`STORED` / `ALREADY_CURRENT`) carries the distinction separately, for
+observability only, so it can't affect `Put`'s ack-counting. Getting this
+wrong — treating a dominated-and-discarded write as `success=false` — would
+undercount acks for writes that already succeeded everywhere they needed to,
+producing spurious quorum failures exactly when the system is behaving
+correctly.
+
+Also settled: what a replica does when its existing copy is *concurrent*
+with (not dominated by) the incoming write. Rejected letting the replica
+run its own local LWW tiebreak on receipt — that's per-replica independent
+resolution again, already rejected above, and for the identical reason:
+two replicas each holding a different concurrent existing copy, each
+correctly applying the same deterministic rule to different inputs, can
+still land on different winners. Resolution: a replica refuses (reports
+`ALREADY_CURRENT`) only on strict dominance; on concurrent, it stores the
+incoming write anyway and does not arbitrate. Any resulting disagreement
+between replicas is the same transient-staleness case D1 already accepts
+elsewhere — resolved later by a `Get` comparing through it, or by Phase 6.
+
+### Decision D1 — Storage shape
+Single `(value, vector_clock)` slot per key, per replica. No sibling list,
+no separate object-level LWW field. `Get`'s fan-out logic (replacing the
+old arrival-order-wins mechanism entirely) becomes: collect whatever
+`(value, vector_clock)` each of the R responding replicas holds, run
+dominance comparison across the collected set, discard anything dominated,
+and if more than one survivor remains, apply the B2/B3 LWW tiebreak. Return
+one resolved value to the client either way.
+
+**Why, reasoned through in-session rather than asserted:** two coordinators
+handling concurrent writes to the same key structurally cannot see each
+other's write at write time (per C1's named limit above) — so the earliest
+point their two clocks can ever be compared is when a `Get()` happens to
+collect both from different replicas (plausible specifically because W<N
+means replica histories can differ). This is a structural fact about where
+the information first converges, not a latency-vs-correctness preference.
+Matches Dynamo's own stated design stance directly: push reconciliation
+cost onto reads, keep writes cheap and always-available (the paper's own
+example being a shopping cart that must accept a write even mid-partition).
+
+**Explicit phase boundary:** the comparison-and-answer-the-client half
+(above) is Phase 4 scope, because a plain `get()` can't return two answers.
+**Writing the reconciled winner back to the stale replica is explicitly
+Phase 6's job (read-repair)**, not this phase's — a stale replica is
+allowed to sit stale, discovered-but-unrepaired, until Phase 6 exists or a
+future `Get()` happens to compare through it again.
+
+**Rejected:** a sibling list plus a separate global-LWW field — the
+original instinct going into this session. Walked back because it
+contradicts C1 (nothing downstream of a coordinator's single resolved write
+should ever need to store more than one version per replica) and would
+quietly reintroduce the client-exposed-siblings machinery that choosing
+LWW over sibling-versions was meant to avoid in the first place (see the
+LWW-vs-siblings decision below). What actually needs multiple values isn't
+a single replica's storage — it's the transient disagreement *across*
+replicas, which D1's comparison-at-read-time design already accounts for
+without any replica ever holding more than one slot.
+
+### Decision D2/D3 — Proto shape, `Get` clock exposure — finalized and implemented (branch 1)
+`Get` exposing the clock in its response isn't a separate decision from A2 —
+it falls out mechanically of the client needing context back to round-trip
+into a future `put()`.
+
+Final message shape:
+
+```protobuf
+message VectorClock {
+    map<string, uint64> counters = 1; // node_id -> that node's counter for this key
+    int64 last_updated = 2;            // stamped once by the coordinating node (B2) — LWW input only, never read by dominance comparison
+}
+
+enum WriteOutcome {
+    STORED = 0;
+    ALREADY_CURRENT = 1;
+}
+```
+
+`counters` chosen over a `repeated` list of (node_id, count) pairs
+specifically because a map enforces "one counter per node" at the type
+level — a repeated list would let duplicate `node_id` entries exist with
+nothing stopping them, a real footgun for a structure whose core invariant
+is one counter per node. Mirrors `MembershipTable`'s existing
+`map<string, MembershipEntry>` shape rather than inventing a new pattern.
+
+**Field naming convention, applied deliberately, not per-RPC guesswork:**
+`context` wherever a field is client-facing — meaning it's expected to be
+held and round-tripped by an external caller across calls (`PutRequest`,
+`PutResponse`, `GetResponse`). `vector_clock` wherever the field is just the
+object's canonical clock moving replica-to-replica with no external
+observer holding it (`ReplicateWriteRequest`, `ReplicateReadResponse`).
+One initial naming pass used a third name (`resulting_clock`) for
+`PutResponse` before this convention was applied consistently — corrected,
+since `PutResponse.context` plays the identical role `GetResponse.context`
+does (something the client caches for its next call) and deserved the same
+name, not a bespoke one.
+
+Full finalized field list, as implemented in branch 1
+(`phase4/proto-vector-clock`):
+
+```protobuf
+message PutRequest {
+    string key = 1;
+    string value = 2;
+    VectorClock context = 3;
+}
+
+message PutResponse {
+    bool success = 1;
+    int32 acks = 2;
+    VectorClock context = 3;
+}
+
+message GetResponse {
+    bool found = 1;
+    string value = 2;
+    int32 responses = 3;
+    VectorClock context = 4;
+}
+
+message ReplicateWriteRequest {
+    string key = 1;
+    string value = 2;
+    VectorClock vector_clock = 3;
+}
+
+message ReplicateWriteResponse {
+    bool success = 1;       // unchanged Q16 meaning — self-removed refusal only
+    WriteOutcome outcome = 2; // observability only, does not affect ack-counting
+}
+
+message ReplicateReadResponse {
+    bool found = 1;
+    string value = 2;
+    VectorClock vector_clock = 3; // present iff found
+}
+```
+
+### Decision E1 — Logging
+No new event fired on every comparison (a `DOMINATE`/`DOMINATED`/
+`CONCURRENT` event per write was considered and rejected — same log-clutter
+tradeoff already declined at Q23 for `ReplicateWrite`/`ReplicateRead`).
+Instead: extend the existing `PUT_SUCCEEDED`/`GET_SUCCEEDED` log lines with
+a `clock=` field, matching the project plan's own Phase 4 guidance ("log
+the full vector clock on every read/write"). One new event reserved for the
+genuinely interesting case: fires only when comparison returns concurrent
+and LWW has to decide, logging both candidate clocks, both timestamps, and
+the winner — gives a grep target for this phase's non-deterministic,
+timing-dependent scenario without noise on the ordinary sequential-write
+case. A second, rarely-expected event is worth adding as a canary for
+B1's atomic-section correctness — should essentially never fire once the
+critical section is implemented correctly; if it does, that's a live signal
+the lock-widening has a bug.
+
+### F1 / Q19 status
+Unchanged, still open — see Q19's update below for what this phase adds to
+its stakes.
+
+### LWW vs. sibling versions — the phase's headline decision, resolved
+**LWW**, applied narrowly: vector-clock dominance is always checked first
+and resolves the common sequential-write case with zero dependency on any
+clock; LWW is invoked only on the residual case where dominance comparison
+genuinely returns concurrent. Explicitly *not* "vector clocks computed then
+thrown away by a blanket timestamp rule" — the two mechanisms are scoped to
+different, non-overlapping cases by design.
+
+**Why, beyond "simpler":** for an opaque-string KV store (unlike Dynamo's
+own shopping-cart example), there is no principled server-side semantic
+merge available regardless of which policy is chosen — a store has no way
+to know whether concatenating two conflicting strings is meaningful. Given
+that, sibling-exposure's real benefit isn't a smarter resolution, it's
+*visibility* of the write that would otherwise be discarded (something can
+notice/log/alert on it before it's gone) — weighed against a genuinely
+larger client API and reconciliation-loop surface for a store with several
+more phases still ahead of it. LWW was chosen with that visibility cost
+named directly, not hand-waved: a genuine concurrent write's loser is gone,
+not recoverable, and "most recent" is only as trustworthy as the B3-accepted
+clock-skew risk.
+**Rejected:** sibling versions (Dynamo's own choice, made deliberately for
+data — shopping carts — judged too valuable to risk losing; real Riak also
+defaults this way). Not rejected because it's wrong in general, just judged
+not worth its cost for this project's scope, and explicitly *not* Cassandra's
+approach either (pure timestamp-LWW, no vector clocks at all) — the chosen
+design keeps vector clocks doing real, clock-independent work in the common
+case, which is the version of this decision worth defending in an
+interview.
+
+### GTStore comparisons made this session
+- **`Get`'s replacement mechanism, directly:** the naive arrival-order
+  winner Phase 3 shipped with is being replaced because Phase 3's own
+  sloppy-quorum design (W<N) is what makes replica disagreement possible in
+  the first place. GTStore's write-all-K blocks until every replica agrees,
+  so its read path never needs to ask "did I just see one replica's opinion,
+  or the field's actual current state" — that question doesn't exist in a
+  system where every successful write is already agreed upon everywhere.
+  Driftstore inverted that specific decision in Phase 3, and Phase 4 is
+  the direct bill for it.
+- **Write-time cost vs. read-time cost, as an explicit inversion:** GTStore
+  pays its consistency cost at write time (blocks until all K replicas ack,
+  or fails outright) and never at read time (every read is trivially
+  single-valued). Driftstore's Phase 4 design deliberately pays the
+  opposite way — writes stay cheap (local merge only, no quorum read-before-
+  write), reads absorb comparison cost — matching Dynamo's own stated
+  "always writeable" design stance rather than an arbitrary choice.
+- **LWW's wall-clock dependency has no GTStore analog at all:** GTStore's
+  write-all-K model has no tiebreak mechanism because it has no concurrent-
+  write case to break a tie on — every write that succeeds is, by
+  construction, agreed upon by every replica before the client ever gets a
+  response. B3's accepted clock-skew risk is a cost that only exists
+  because Driftstore chose to let writes succeed before full agreement;
+  GTStore structurally cannot have this problem, at the cost of blocking
+  on exactly the down-replica scenario Driftstore's Phase 3 was built to
+  tolerate.
+
+### Phase 4 implementation roadmap
+Nine branches, treated as sequential checkpoints — each merges to `main`
+before the next starts, so the PR history doubles as the implementation
+log. Ordered by actual dependency: proto and the pure comparison logic
+before anything wires into them; write path before read path (`Get`'s
+frontier logic needs real `VersionedValue`s to test against); client and
+observability last since they consume the mechanism rather than define it.
+
+1. **`phase4/proto-vector-clock`** — ✅ **Merged.** `VectorClock`,
+   `WriteOutcome`, and the finalized field additions across
+   `Put`/`Get`/`ReplicateWrite`/`ReplicateRead` (full shape in D2/D3
+   above). Pure schema change — nothing reads or writes any new field yet;
+   confirmed behavior-neutral against existing harnesses
+   (`smoke_test.sh`, `test_coordinator_rotation.sh`).
+2. **`phase4/vector-clock-library`** — ✅ **Merged.** All six functions
+   implemented in `vector_clock.hpp`: `compareVectorClocks`, `mergeClocks`,
+   `buildNewClock`, `computeFrontier`, `resolveLWW`, `resolveGetResult`.
+   Q24 (exact-timestamp-tie tiebreak) resolved as part of this branch, with
+   a correction made to its original justification during design — see
+   `OPEN_QUESTIONS.md`. Standalone tests added in `test_vector_clocks.cpp`,
+   same role `test_ring.cpp` plays for ring math — full write-up in
+   "Branch 2 close-out" below.
+3. **`phase4/put-write-path`** — ⬜ Not started. Migrate `kv_store_` to
+   `unordered_map<string, VersionedValue>`. Wire `Put`: widen the
+   `kv_store_mutex_` critical section per B1, call `buildNewClock` exactly
+   once before fan-out per C1, populate `PutResponse.context`, send the
+   coordinator's single resolved clock to every peer via `ReplicateWrite`.
+4. **`phase4/replicate-write-defensive-check`** — ⬜ Not started. Update
+   `ReplicateWrite`'s handler per the finalized C1 semantics above:
+   dominance check, `STORED`/`ALREADY_CURRENT` outcome, concurrent-with-
+   existing still stores (no local arbitration). Verify ack-counting is
+   unaffected by `outcome`.
+5. **`phase4/get-read-path`** — ⬜ Not started. Replace `Get`'s
+   arrival-order-wins logic (Q20, fully superseded) with
+   `resolveGetResult` over collected replica responses; populate
+   `GetResponse.context`.
+6. **`phase4/driftclient-context-roundtrip`** — ⬜ Not started.
+   `DriftClient` holds the last-seen context per key and round-trips it
+   through `put()`/`get()`; update the CLI driver to exercise it.
+7. **`phase4/observability-logging`** — ⬜ Not started. `clock=` on
+   existing `PUT_SUCCEEDED`/`GET_SUCCEEDED` lines; new `CONFLICT_RESOLVED`
+   event (fires only on genuine concurrency) and `EQUAL_CLOCK_DETECTED`
+   canary (should essentially never fire if B1's critical section is
+   correct).
+8. **`phase4/conflict-scenario-harness`** — ⬜ Not started. Scripted,
+   reproducible two-coordinator concurrent-write scenario, correlated
+   against `CONFLICT_RESOLVED`, same pattern as
+   `test_coordinator_rotation.sh`.
+9. **`phase4/close-out-docs`** — ⬜ Not started. Flip Phase 4 to done in
+   this file, resolve/update `OPEN_QUESTIONS.md` entries this phase
+   touched (Q20 closes here; Q24/Q25 likely stay open), explain-from-memory
+   checkpoint before Phase 5.
+
+### Branch 1 close-out — `phase4/proto-vector-clock`
+Merged to `main`. Added `VectorClock`/`WriteOutcome` and threaded the
+finalized field list (D2/D3 above) through `Put`/`Get`/`ReplicateWrite`/
+`ReplicateRead`. No behavior change — confirmed via existing test
+harnesses passing unmodified. Nothing in `node.cpp`/`driftclient.cpp`
+reads or writes any new field yet; that starts with branch 2.
+
+### Branch 2 close-out — `phase4/vector-clock-library`
+Merged to `main`. All six functions in `vector_clock.hpp` implemented:
+`compareVectorClocks`, `mergeClocks`, `buildNewClock`, `computeFrontier`,
+`resolveLWW`, `resolveGetResult`. Standalone test file
+`test_vector_clocks.cpp` added (`make bin/test_vector_clocks`), covering
+all six directly rather than only through downstream callers — same role
+`test_ring.cpp` plays for ring math. All tests passing.
+
+**Q24 resolved** — full write-up in `OPEN_QUESTIONS.md`'s Resolved
+section. Summary: `VectorClock` gained a `writer_id` field (string,
+mirrors `MembershipEntry.writer_id`); `resolveLWW` tiebreaks
+`last_updated` first, `writer_id` second, first-seen-wins on a full tie
+(documented at the call site as deliberate, not an accidental
+fallthrough). The original justification for reaching for `writer_id` —
+"concurrent entries can't share a writer_id" — was corrected during
+design: false specifically for a coordinator that isn't a replica for the
+key (`local_copy = nullopt` on every call, per A1), since its contributed
+axis then depends entirely on whatever `client_context` a given caller
+supplies, and two different callers with mutually-non-dominating contexts
+can produce genuinely `CONCURRENT` clocks that both carry that
+coordinator's `writer_id`. Verified directly against `compareVectorClocks`
+with a constructed counterexample (`{X:1,Y:2}` vs. `{X:1,Z:5}`, both
+`writer_id=X`, correctly classified `CONCURRENT`). Accepted the same way
+B3/Q25 already accepts wall-clock skew: `writer_id` narrows the residual
+tie risk substantially, doesn't formally eliminate it — a true unresolved
+tie now needs both an exact `last_updated` collision *and* this specific
+non-replica-coordinator scenario to coincide.
+
+**`resolveGetResult`'s signature changed from the original stub's
+`const VersionedValue&` to `VersionedValue` (by value)**, caught before
+any caller existed. `computeFrontier` copies survivors into its output
+vector rather than referencing back into its input, so a
+reference-returning `resolveGetResult` would dangle the instant its local
+`frontier` vector is destroyed — the reference would point at a copy that
+no longer exists by the time the caller reads it. By-value also matches
+what `Get`'s handler (branch 5) will do with the result regardless (copy
+`.value`/`.clock` into `GetResponse`), so nothing is lost by making the
+copy explicit in the return.
+
+**`nowMillis()` relocated** from `node.cpp`'s anonymous namespace into
+`logging.hpp`, so `vector_clock.hpp`'s `buildNewClock` can use the same
+implementation `node.cpp` already used for `MembershipEntry.last_updated`,
+rather than duplicating the `duration_cast`/`time_since_epoch` conversion
+in a second place. Kept internal-linkage-safe (not a bare free function),
+specifically because `logging.hpp` is now `#include`d by more than one
+translation unit — a bare external-linkage definition would produce a
+multiple-definition link error the first time both `node.cpp` and
+anything including `vector_clock.hpp` got linked together.
+
+**Bugs caught during design/implementation, before landing:**
+- Two separate dangling-reference bugs from returning `const
+  VersionedValue&` bound to a local variable or a copy rather than into
+  data the caller actually owns — first in an early `resolveLWW` draft
+  (tracking the winner in a local `VersionedValue` copy instead of a
+  pointer/reference into `concurrent_versions`), then in
+  `resolveGetResult` itself (see signature change above).
+- An early `computeFrontier` draft folded LWW's timestamp comparison
+  directly into the frontier-reduction loop (dropping the older-timestamp
+  entry on both `EQUAL` and `CONCURRENT`), which silently collapsed a
+  genuine N-way concurrent set down to a single survivor before
+  `resolveLWW` ever ran — traced by hand against a constructed 3-entry
+  concurrent example (three single-axis clocks, all pairwise `CONCURRENT`)
+  before being caught; now covered by a regression test
+  (`testComputeFrontier`'s 3-way concurrent case, asserting all three
+  survive).
+- `computeFrontier`'s `EQUAL`-dedupe needed an explicit `j < i` ordering
+  rule, not an unconditional drop-on-`EQUAL` — the latter eliminates
+  *both* members of a true-duplicate pair (`EQUAL` is symmetric, so `i`
+  disqualifies `j` and `j` disqualifies `i` simultaneously), leaving zero
+  survivors from a set that should collapse to exactly one.
+- Several early `mergeClocks`/`buildNewClock` drafts had compile-level
+  issues (protobuf `Map` has no bulk `set_counters()` setter, only
+  `mutable_counters()`; `*ptr[key]` vs. `(*ptr)[key]` precedence when
+  dereferencing a pointer to a map; passing `std::optional<VectorClock>`
+  directly where `mergeClocks` expects `const VectorClock&`, needing
+  `value_or(VectorClock())`) — caught via compiler errors and code review
+  before ever reaching a test run.
+- Multiple test-file bugs caught by review before being trusted: asserting
+  against a stale previous-test result variable instead of the
+  just-computed one; a "tie" test case that built distinguishing clocks
+  but then assigned an earlier test's clocks into the `VersionedValue`s
+  actually pushed into the input vector, silently testing the wrong
+  scenario; a "common case" test whose winning entry happened to already
+  be the loop's seed value, meaning the comparison branch that test was
+  supposed to exercise never actually executed on that input.
+
+**GTStore comparison, this branch specifically:** this is the first
+branch where reading a key does real work. Through Phase 3, `Get` was as
+trivial as GTStore's — fetch, return, done — because write-all-K means no
+two replicas can ever disagree once a write succeeds, so there's no
+"which one is right" question to ask. Every `Get` Driftstore serves from
+here on pays a pairwise `O(n²)` dominance comparison, and on genuine
+conflict, a `last_updated`-then-`writer_id` tiebreak — the concrete,
+line-level cost of `W<N` letting writes succeed before full replication,
+paid at read time because Phase 3 chose not to pay it at write time.
 
 ---
 

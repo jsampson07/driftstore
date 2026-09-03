@@ -1,5 +1,6 @@
 #pragma once
 #include "driftstore.pb.h"
+#include "logging.hpp"
 
 #include <optional>
 #include <stdexcept>
@@ -130,7 +131,7 @@ inline driftstore::VectorClock mergeClocks(const driftstore::VectorClock& a,
             (*vc.mutable_counters())[node_id] = max_val;
             shared_key_cnt++;
         } else {
-            *(vc.mutable_counters())[node_id] = a_cnt;
+            (*vc.mutable_counters())[node_id] = a_cnt;
         }
     }
 
@@ -138,7 +139,7 @@ inline driftstore::VectorClock mergeClocks(const driftstore::VectorClock& a,
         // Second Pass: Check for presence of B entries not in A (NOT covered in first pass) --> ONLY if we did NOT iterate through all entries in B
         for (const auto& [node_id, b_cnt] : b_map) {
             if (a_map.find(node_id) == a_map.end()) {
-                *(vc.mutable_counters())[node_id] = b_cnt;
+                (*vc.mutable_counters())[node_id] = b_cnt;
             }
         }
     }
@@ -178,7 +179,10 @@ inline driftstore::VectorClock buildNewClock(
     //    the ONE place a new timestamp gets written; everywhere else
     //    (replication, reconciliation) just carries an existing one
     //    forward, per B2
-    throw std::logic_error("buildNewClock: not yet implemented");
+    driftstore::VectorClock merged = mergeClocks(client_context.value_or(driftstore::VectorClock()), local_copy.value_or(driftstore::VectorClock()));
+    (*merged.mutable_counters())[coordinator_node_id] += 1;
+    merged.set_last_updated(nowMillis());
+    return merged;
 }
 
 // Decision B2/B3: applies the LWW tiebreak to a set of versions already

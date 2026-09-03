@@ -241,6 +241,17 @@ scenarios where a silent mismatch would actually bite.
 implemented — see `PROGRESS.md`'s Phase 3 implementation session for the
 full comparison against `--vnodes` and against GTStore's single-process `K`.
 
+**Update, Phase 4 design session:** stakes raised further, not resolved.
+Phase 4's vector-clock dominance comparison implicitly assumes every
+coordinator computes `preferenceListForKey(key, N)` against the same `N` —
+if two coordinators disagree on `N`, they can compute different replica
+sets for the identical key, which undermines the premise that a `Get`'s
+fan-out is even comparing clocks for "the same" replica set in the first
+place. Still not blocking Phase 4 specifically (a single-`N`-per-cluster
+test setup sidesteps it), but the cost of leaving this unresolved keeps
+compounding as more phases build on `N`/`W`/`R` meaning something
+consistent cluster-wide.
+
 ### Q20 — Should a coordinator's own local read winning arrival-order ties be an explicit policy, or just an accepted side effect?
 `Get`'s first-arrived-response selection stamps the coordinator's own local
 read (when it's in the preference list) with sequence `0` unconditionally,
@@ -327,6 +338,46 @@ Revisit if a concrete scenario actually needs it, same as Q13.
 *Context:* raised while designing `DriftClient`'s failover semantics,
 Phase 3 close-out session.
 *Resolved during:* same session.
+
+### Q25 — Wall-clock skew risk on Phase 4's LWW tiebreak
+Phase 4's conflict resolution (`PROGRESS.md`, decisions B2/B3) falls back
+to comparing wall-clock timestamps only in the case vector-clock dominance
+comparison genuinely returns concurrent — but that fallback is exactly as
+exposed to inter-node clock skew as gossip's `last_updated`-based LWW
+already is (Q1's related edge case). Concrete failure case discussed in
+session: a write proven causally later by vector-clock dominance, if
+LWW were ever consulted for it, could in principle be coordinated by a
+node whose clock runs behind the peer that coordinated the causally-earlier
+write — though this specific scenario is actually *ruled out* by design,
+since dominance comparison is always checked first and is immune to clock
+skew by construction; LWW only ever sees pairs where no causal ordering
+exists at all. The residual exposure is narrower than it first sounds, but
+not zero: two genuinely concurrent writes' relative "recency" as judged by
+LWW is still only as trustworthy as how well-synchronized the two
+coordinating nodes' clocks are.
+
+**Resolution: accepted, not solved — same treatment Q1 already gave
+gossip's `last_updated`.** No NTP-style clock discipline is in scope for
+this project. Explicitly named as a defensible-but-real tradeoff in the
+LWW-vs-siblings decision (see `PROGRESS.md`'s Phase 4 section): the
+alternative (sibling versions) avoids this risk entirely by never
+discarding a write based on timestamp comparison at all, but was rejected
+on its own separate cost grounds (client-exposed reconciliation, API
+surface) — not because this risk was judged acceptable in isolation.
+
+*Status:* accepted risk, tracked — not blocking, but worth keeping visible
+alongside Q1 rather than letting it look silently resolved.
+*Context:* raised during the Phase 4 vector-clock design conversation,
+decision B3.
+
+**Update, `phase4/vector-clock-library` session:** Q24 (below, now
+Resolved) added a `writer_id` secondary tiebreak, which narrows LWW's
+exposure but is a distinct risk from this one, not a fix for it — Q24's
+residual gap is about `writer_id` not being a provably unique secondary
+key for every `CONCURRENT` pair, this question is about the trustworthiness
+of `last_updated` itself once LWW is consulted at all. Both are now
+accepted-and-named on the same terms, not stacked into a false sense that
+one covers the other.
 
 ---
 
@@ -642,3 +693,64 @@ anyway).
 by a failing assertion that turned out to be checking for something
 deliberately absent, not something broken.
 *Resolved during:* same session.
+
+### Q24 — Exact-timestamp-tie tiebreak for Phase 4's LWW conflict resolution
+Phase 4's LWW tiebreak (see `PROGRESS.md`'s Phase 4 design section, decision
+B2) resolves a genuinely-concurrent vector-clock comparison by comparing
+each candidate version's stored `last_updated` timestamp. Two different
+concurrent writes — different clocks, different values — could plausibly
+tie at whatever timestamp resolution is chosen (e.g. both stamped in the
+same millisecond). Nothing currently defines a secondary tiebreak for this
+case. Note this is distinct from B1's equal-clock case (Phase 4 design
+section): B1 is the *same* write's clock appearing twice, safely
+order-independent; this is *two different* writes whose independently-
+computed timestamps happen to collide.
+
+**Precedent available but not yet applied:** Q1 resolved the equivalent
+problem at the gossip-membership layer with a `writer_id` secondary key on
+an exact timestamp tie. Carrying the same shape forward here (e.g. the
+coordinating node's own id) is the obvious candidate, but hasn't been
+decided.
+
+**Resolution:** `VectorClock` gained a third field, `writer_id` (string,
+mirrors `MembershipEntry.writer_id`'s type) — the coordinating node's own
+id, stamped alongside `last_updated` by whichever node builds the clock in
+`buildNewClock`. `resolveLWW` tiebreaks in two steps: `last_updated`
+first, `writer_id` second (higher wins — the same "some deterministic
+total order breaks it" shape Q1 already established, not a claim that
+node_id ordering carries any real-world meaning). A true double-tie (same
+`last_updated` **and** same `writer_id`) deterministically keeps whichever
+entry was encountered first in the input — documented at the call site as
+an intentional fallthrough, not an accident of control flow.
+
+**Correction made to the original justification, during implementation
+design:** the initial reasoning for reaching for `writer_id` at all
+assumed two genuinely `CONCURRENT` versions could never share a
+`writer_id` — "a node can only have one version it sees for a key." That's
+false in one specific, real case: a coordinator that isn't a replica for
+the key in question has `local_copy = nullopt` on every call (per decision
+A1), so it retains no memory of its own prior writes to that key between
+separate `Put`s — its contributed axis is driven entirely by whatever
+`client_context` a given caller happens to supply. Two different callers,
+routed through the same non-replica coordinator, with mutually-non-
+dominating cached contexts, can produce genuinely `CONCURRENT` clocks that
+both carry that coordinator's `writer_id`. Constructed and verified
+against `compareVectorClocks` directly: `{X:1,Y:2}` and `{X:1,Z:5}`, both
+`writer_id=X`, correctly classified `CONCURRENT` (`X` axis ties, `Y` favors
+the first, `Z` favors the second — both `a_greater` and `b_greater` end up
+true).
+
+Given that, the `writer_id` tiebreak doesn't formally eliminate Q24's tie
+risk — it narrows it. A residual tie now requires *both* an exact
+`last_updated` collision *and* this specific same-non-replica-coordinator-
+divergent-context scenario to coincide. Accepted on the same terms Q25
+already accepts wall-clock skew: named honestly, not solved, and not
+asserted as a stronger guarantee than it actually is.
+
+*Context:* raised during the Phase 4 vector-clock design conversation,
+while settling decision B2 (LWW timestamp placement).
+*Resolved during:* `phase4/vector-clock-library` (branch 2/9)
+implementation session — `writer_id` field added, `resolveLWW`
+implemented and tested (`test_vector_clocks.cpp`: timestamp-decides-it
+case, timestamp-tie-broken-by-writer_id case, full-tie-keeps-first-seen
+case).

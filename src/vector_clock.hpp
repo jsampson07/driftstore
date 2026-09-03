@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <algorithm>
 
 // ---------------------------------------------------------------------
 // Phase 4 scaffolding. Every body below is a stub — TODO markers, not
@@ -66,13 +67,13 @@ inline ClockComparison compareVectorClocks(const driftstore::VectorClock& a,
     const auto& b_map = b.counters();
 
     // First Pass: Check presence of A entries in B
-    int pass = 0;
+    int shared_key_cnt = 0;
     for (const auto& [node_id, a_cnt] : a_map) {
         auto it = b_map.find(node_id);
         uint64_t b_cnt;
         if (it != b_map.end()) {
             b_cnt = it->second;
-            pass++;
+            shared_key_cnt++;
         } else {
             b_cnt = 0;
         }
@@ -81,7 +82,7 @@ inline ClockComparison compareVectorClocks(const driftstore::VectorClock& a,
         if (a_greater && b_greater) break;
     }
 
-    if (pass < b_map.size() && !(a_greater && b_greater)) {
+    if (shared_key_cnt < b_map.size() && !(a_greater && b_greater)) {
         // Second Pass: Check for presence of B entries not in A (NOT covered in first pass) --> ONLY if we did NOT iterate through all entries in B
         for (const auto& [node_id, b_cnt] : b_map) {
             if (a_map.find(node_id) == a_map.end()) {
@@ -115,7 +116,33 @@ inline driftstore::VectorClock mergeClocks(const driftstore::VectorClock& a,
     // b.counters(), write max(a's count, b's count) into the result.
     // last_updated is intentionally left unset here — buildNewClock sets
     // it after this returns.
-    throw std::logic_error("mergeClocks: not yet implemented");
+    driftstore::VectorClock vc;
+
+    const auto& a_map = a.counters();
+    const auto& b_map = b.counters();
+
+    // First Pass: Check presence of A entries in B
+    int shared_key_cnt = 0;
+    for (const auto& [node_id, a_cnt] : a_map) {
+        auto it = b_map.find(node_id);
+        if (it != b_map.end()) {
+            uint64_t max_val = std::max(a_cnt, it->second);
+            (*vc.mutable_counters())[node_id] = max_val;
+            shared_key_cnt++;
+        } else {
+            *(vc.mutable_counters())[node_id] = a_cnt;
+        }
+    }
+
+    if (shared_key_cnt < b_map.size()) {
+        // Second Pass: Check for presence of B entries not in A (NOT covered in first pass) --> ONLY if we did NOT iterate through all entries in B
+        for (const auto& [node_id, b_cnt] : b_map) {
+            if (a_map.find(node_id) == a_map.end()) {
+                *(vc.mutable_counters())[node_id] = b_cnt;
+            }
+        }
+    }
+    return vc;
 }
 
 // Decision A1, full sequence: builds the vector clock for a new write.

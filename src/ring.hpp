@@ -8,7 +8,7 @@
 #include <vector>
 #include <functional>
 
-uint64_t mix64(uint64_t x) {
+inline uint64_t mix64(uint64_t x) {
     x ^= x >> 30;
     x *= 0xbf58476d1ce4e5b9ULL;
     x ^= x >> 27;
@@ -17,7 +17,7 @@ uint64_t mix64(uint64_t x) {
     return x;
 }
 
-uint64_t fnv1a64(const std::string& data) {
+inline uint64_t fnv1a64(const std::string& data) {
     uint64_t hash = 0xcbf29ce484222325ULL;  // FNV offset basis
     for (unsigned char c : data) {
         hash ^= c;                          // XOR first...

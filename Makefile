@@ -25,9 +25,9 @@ $(PROTO_GEN): $(PROTO_SRC)
 
 # Single "node" binary, not manager+storage: Driftstore has no centralized
 # manager role, so every process is the same symmetric peer.
-$(BIN_DIR)/node: src/node.cpp $(PROTO_GEN)
+$(BIN_DIR)/node: src/node_membership.cpp src/node_reachability.cpp src/node_kv.cpp src/node_status.cpp src/node_main.cpp src/node_service.hpp $(PROTO_GEN)
 	mkdir -p $(BIN_DIR)
-	$(CC) $(CFLAGS) src/node.cpp $(PROTO_GEN) $(LFLAGS) -o $(BIN_DIR)/node
+	$(CC) $(CFLAGS) src/node_membership.cpp src/node_reachability.cpp src/node_kv.cpp src/node_status.cpp src/node_main.cpp $(PROTO_GEN) $(LFLAGS) -o $(BIN_DIR)/node
 
 $(BIN_DIR)/client: src/client.cpp $(PROTO_GEN)
 	mkdir -p $(BIN_DIR)

@@ -116,6 +116,19 @@ private:
 
     std::optional<std::string> localGet(const std::string& key);
 
+    // Coordinator-side only. Caller (coordinatePut) guarantees node_id_ ∈ pref_list
+    // before calling this — that guarantee is what makes the lock meaningful now.
+    // One locked read→merge→increment→store, returns the resolved clock.
+    driftstore::VectorClock commitCoordinatedWrite(
+        const std::string& key,
+        const std::string& value,
+        const std::optional<driftstore::VectorClock>& client_context);
+
+    // Replica-side, used by ReplicateWrite. Clock already resolved by the
+    // coordinator — no buildNewClock call. Plain overwrite for now;
+    // branch 4 adds the dominance check inside this same function.
+    void storeReplicatedWrite(const std::string& key, const VersionedValue& incoming);
+
     void gossipLoop(int64_t gossip_interval_ms);
 
     void reachabilityLoop(int64_t reachability_interval_ms);

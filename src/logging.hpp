@@ -32,6 +32,8 @@ enum class EventType {
     PUT_INIT,
     PUT_SUCCEEDED,
     PUT_FAILED,
+    PUT_FORWARDED, // logged by the receiving-but-not-coordinating node
+    PUT_FORWARD_FAILED, // logged if new receiver fails to connect (before failure handling sequence)
 };
 
 inline const char* toString(EventType e) {
@@ -63,6 +65,8 @@ inline const char* toString(EventType e) {
         case EventType::PUT_INIT: return "PUT_INIT";
         case EventType::PUT_SUCCEEDED: return "PUT_SUCCEEDED";
         case EventType::PUT_FAILED: return "PUT_FAILED";
+        case EventType::PUT_FORWARDED: return "PUT_FORWARDED";
+        case EventType::PUT_FORWARD_FAILED: return "PUT_FORWARD_FAILED";
     }
 }
 

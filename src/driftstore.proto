@@ -45,6 +45,7 @@ message PutRequest {
     string key = 1;
     string value = 2;
     VectorClock context = 3; // this is optional: abset means blind write
+    bool forwarded = 4;
 }
 
 message PutResponse {

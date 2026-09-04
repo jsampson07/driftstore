@@ -66,7 +66,7 @@ inline const char* toString(EventType e) {
     }
 }
 
-int64_t nowMillis() {
+inline int64_t nowMillis() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()
     ).count();

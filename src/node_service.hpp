@@ -1,6 +1,7 @@
 #pragma once
 
 #include "driftstore.grpc.pb.h"
+#include "vector_clock.hpp"
 
 #include <grpcpp/grpcpp.h>
 
@@ -104,7 +105,7 @@ private:
     std::map<uint64_t, std::string> ring_;
     std::unordered_set<std::string> unreachable_peers_;
     std::mutex unreachable_peers_mutex_;
-    std::unordered_map<std::string, std::string> kv_store_;
+    std::unordered_map<std::string, VersionedValue> kv_store_;
     std::mutex kv_store_mutex_;
     int64_t N_;
     int64_t W_;
@@ -112,9 +113,32 @@ private:
 
     bool pingPeer(const std::string& peer_addr);
 
-    void localPut(const std::string& key, const std::string& value);
+    void localPut(const std::string& key, const VersionedValue& value);
 
-    std::optional<std::string> localGet(const std::string& key);
+    std::optional<VersionedValue> localGet(const std::string& key);
+
+    grpc::Status forwardPut(const driftstore::PutRequest* request,
+                            const std::vector<std::string>& pref_list,
+                            driftstore::PutResponse* response);
+
+    grpc::Status coordinatePut(const std::string& key,
+                                const std::string& value,
+                                const std::optional<driftstore::VectorClock>& client_context,
+                                const std::vector<std::string>& pref_list,
+                                driftstore::PutResponse* response);
+
+    // Coordinator-side only. Caller (coordinatePut) guarantees node_id_ ∈ pref_list
+    // before calling this — that guarantee is what makes the lock meaningful now.
+    // One locked read→merge→increment→store, returns the resolved clock.
+    driftstore::VectorClock commitCoordinatedWrite(
+        const std::string& key,
+        const std::string& value,
+        const std::optional<driftstore::VectorClock>& client_context);
+
+    // Replica-side, used by ReplicateWrite. Clock already resolved by the
+    // coordinator — no buildNewClock call. Plain overwrite for now;
+    // branch 4 adds the dominance check inside this same function.
+    void storeReplicatedWrite(const std::string& key, const VersionedValue& incoming);
 
     void gossipLoop(int64_t gossip_interval_ms);
 

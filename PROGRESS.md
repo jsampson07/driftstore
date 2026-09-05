@@ -13,7 +13,7 @@
 | 1 | Gossip membership + local failure detection | ✅ Done |
 | 2 | Consistent hashing ring + virtual nodes | ✅ Done |
 | 3 | Any-node coordinator + basic quorum read/write | ✅ Done |
-| 4 | Vector clocks + conflict detection | ⬜ Design decided, implementation in progress — branch 2/9 merged |
+| 4 | Vector clocks + conflict detection | ⬜ Design decided, implementation in progress — branch 3/9 merged |
 | 5 | Hinted handoff | ⬜ Not started |
 | 6 | Read-repair | ⬜ Not started |
 | 7 | Dashboard | ⬜ Not started |
@@ -1688,7 +1688,7 @@ project's goal; the client/server boundary was never in scope to invert.
 
 ---
 
-## Phase 4 — Vector clocks + conflict detection (design decided; implementation in progress — branch 2/9 merged)
+## Phase 4 — Vector clocks + conflict detection (design decided; implementation in progress — branch 3/9 merged)
 
 Design conversation followed by staged implementation across nine
 git branches, treated as sequential checkpoints (branch → PR → merge to
@@ -1764,6 +1764,73 @@ therefore always has a clock to return. Safe to cache even from a partial
 (`acks < W`) response — per A1/A2, context can only ever be honestly stale,
 never wrong about causality, so returning it unconditionally doesn't risk
 misrepresenting anything.
+
+### Decision A3 — Write coordination restricted to the key's preference list
+Surfaced while designing `phase4/put-write-path`, not in the original
+Phase 4 design session: a coordinator that isn't a replica for the key
+it's coordinating has no local `kv_store_` entry to read, merge against,
+or lock — decision A1's `local_copy = nullopt` path. That means B1's
+widened-lock fix (below) has nothing to serialize when the coordinator
+holds no local state at all: two genuinely concurrent `Put`s for the
+same key, routed to the same non-replica coordinator, with no
+distinguishing client context, would independently compute the
+identical clock (`mergeClocks(∅,∅)` then increment the same axis by 1)
+for two different values — silently colliding rather than being
+detected as a conflict.
+
+**Resolution:** write coordination is restricted to nodes in the key's
+current preference list, per Dynamo §6.4 ("these preferred nodes have
+the added responsibility of creating a new version stamp that causally
+subsumes the version that has been updated by the write request"). Any
+node can still *receive* a `Put` — "any node can coordinate" isn't being
+walked back for reads, and isn't fully walked back for writes either,
+since a non-preference-list node still services the request — it just
+transparently forwards rather than coordinates. Implemented as option
+(a) of two considered (transparent proxy vs. reject-and-push-routing-
+onto-the-client): the receiving node computes the preference list, and
+if it's not on it, forwards the whole `PutRequest` to a preference-list
+node and relays that node's response back untouched. `PutRequest` gained
+a `bool forwarded` field so a request that's already been forwarded
+once, landing on a node whose own ring view still doesn't place it in
+the preference list (a real possibility under ordinary gossip
+convergence lag, not just a bug), fails immediately instead of
+forwarding again — the loop-breaker.
+
+**Forward target selection:** random pick from the preference list,
+retrying the next entry (wraparound) on transport failure, up to one
+attempt per preference-list member before the whole `Put` fails. Chosen
+specifically so the same node isn't picked twice in a row when more
+than one candidate exists, and so proxy load doesn't concentrate on
+whichever preference-list node happens to sort first.
+
+**Why this is a deliberate narrowing, not a bug fix disguised as one:**
+every other "any node can coordinate" decision in this project (Phase
+3's original design, `Get`'s read path) still holds without
+qualification. This is specifically about *write* coordination, and
+specifically because writes are the only operation that creates a new
+version stamp — reads never call `buildNewClock`, so a non-replica node
+reading a key has nothing analogous to serialize and no
+one-node-only responsibility to protect. Matches Dynamo's own asymmetry
+between read and write coordination, not an arbitrary new restriction
+invented for this project.
+
+**Rejected:** giving a non-replica coordinator some form of local
+per-key memory (e.g. tracking recently-issued clocks for keys it
+doesn't store) so it could still coordinate directly. Considered during
+design, rejected because it would mean maintaining state for keys a
+node has no other reason to know about, purely to paper over a problem
+that already has a structural fix available in the paper this project
+is modeled on.
+
+**GTStore comparison:** GTStore has no equivalent restriction to invert,
+because it never had the equivalent freedom to restrict — a GTStore
+storage node was always the only node that could ever write its own
+keys, so "which nodes are allowed to coordinate a write" was never a
+question GTStore's design had to answer. Driftstore's Phase 3 inversion
+("any node can coordinate") created a degree of freedom GTStore never
+had, and this decision is that freedom's first real cost — narrowed back
+for writes specifically, once a concrete correctness gap showed exactly
+where the freedom broke down.
 
 ### Decision B1 — Equal-clock case
 No distinct comparison-logic branch needed for equal clocks with equal
@@ -2087,11 +2154,11 @@ observability last since they consume the mechanism rather than define it.
    `OPEN_QUESTIONS.md`. Standalone tests added in `test_vector_clocks.cpp`,
    same role `test_ring.cpp` plays for ring math — full write-up in
    "Branch 2 close-out" below.
-3. **`phase4/put-write-path`** — ⬜ Not started. Migrate `kv_store_` to
-   `unordered_map<string, VersionedValue>`. Wire `Put`: widen the
-   `kv_store_mutex_` critical section per B1, call `buildNewClock` exactly
-   once before fan-out per C1, populate `PutResponse.context`, send the
-   coordinator's single resolved clock to every peer via `ReplicateWrite`.
+3. **`phase4/put-write-path`** — ✅ **Merged.** `kv_store_` migrated to
+   `unordered_map<string, VersionedValue>`. `Put` split into
+   `coordinatePut`/`forwardPut` per decision A3 (write coordination
+   restricted to the preference list — new this branch, not in the
+   original roadmap). Full write-up in "Branch 3 close-out" below.
 4. **`phase4/replicate-write-defensive-check`** — ⬜ Not started. Update
    `ReplicateWrite`'s handler per the finalized C1 semantics above:
    dominance check, `STORED`/`ALREADY_CURRENT` outcome, concurrent-with-
@@ -2220,6 +2287,66 @@ here on pays a pairwise `O(n²)` dominance comparison, and on genuine
 conflict, a `last_updated`-then-`writer_id` tiebreak — the concrete,
 line-level cost of `W<N` letting writes succeed before full replication,
 paid at read time because Phase 3 chose not to pay it at write time.
+
+### Branch 3 close-out — `phase4/put-write-path`
+Merged to `main`. `kv_store_` migrated to `unordered_map<string,
+VersionedValue>`. `Put()` split into a thin dispatcher plus two new
+private methods:
+
+- **`coordinatePut`** — runs when `node_id_` is in the key's preference
+  list. Preference-list-size/`W_` check, then `commitCoordinatedWrite`
+  (the B1 atomic critical section: one lock held across read existing
+  entry → `buildNewClock` → store) for the local copy, fan-out
+  `ReplicateWrite` to the rest of the preference list carrying the
+  resolved clock, ack-counting unchanged from Phase 3,
+  `PutResponse.context` populated unconditionally once a clock exists
+  (success and partial-ack paths both, per A2's follow-up).
+- **`forwardPut`** — runs when it isn't. Picks a random preference-list
+  node, retries the next one (wraparound) on transport failure, relays
+  the target's `PutResponse` straight through. See decision A3 above for
+  the `forwarded` field and loop-breaker this depends on.
+
+`ReplicateWrite`'s handler now parses `vector_clock` off the wire and
+stores it via the new `storeReplicatedWrite` (plain overwrite for now —
+the dominance check is branch 4). `localGet` returns
+`optional<VersionedValue>` instead of a bare string; `Get`'s existing
+arrival-order selection (still unchanged — that's branch 5) now also
+copies the winning replica's clock into `GetResponse.context`.
+
+**Decision A3, the actual headline decision this branch made — full
+write-up above**, in the Phase 4 decisions section rather than buried
+here, since it's a design decision on the same footing as A1/A2, not
+just an implementation note.
+
+**Repo structure, incidental to this branch but done because of it:**
+`node.cpp` had grown past ~750 lines as this branch's surface landed on
+top of it. Split into `node_service.hpp` (class declaration only) plus
+`node_membership.cpp`, `node_reachability.cpp`, `node_kv.cpp`,
+`node_status.cpp`, `node_main.cpp` — pure file reorganization, no
+behavior change, done on its own branch (`refactor/node-modularize`)
+and merged first. `Put`/`Get`/`ReplicateWrite`/`ReplicateRead` and the
+new coordinator/forward/commit/store functions all now live in
+`node_kv.cpp`.
+
+**Update to Q24's residual risk, worth independently confirming:** Q24's
+resolution (branch 2) named one concrete counterexample to `writer_id`
+fully closing the tie risk — a non-replica coordinator building
+genuinely `CONCURRENT` clocks that share its own `writer_id`. Decision
+A3 above removes that coordinator's ability to build a clock at all when
+it isn't a replica, and B1's existing serialization already prevents a
+replica-coordinator from producing two colliding clocks for its own
+sequential writes to one key. Taken together, there may no longer be any
+path to two genuinely `CONCURRENT` clocks sharing a `writer_id` for the
+same key — which would mean this tiebreak is complete, not merely
+narrowed. Flagged here rather than asserted as re-resolved in
+`OPEN_QUESTIONS.md` outright — see that file's Q24 entry for the same
+note, written the same way: a claim worth independently re-deriving
+before it's treated as settled, since vector-clock correctness is
+squarely this project's design-it-yourself territory.
+
+**Verification:** `harness/test_coordinator_rotation.sh` passes.
+`harness/smoke_test.sh` and `harness/test_replica_boundary.sh` not yet
+re-run against this branch's changes.
 
 ---
 

@@ -252,6 +252,20 @@ test setup sidesteps it), but the cost of leaving this unresolved keeps
 compounding as more phases build on `N`/`W`/`R` meaning something
 consistent cluster-wide.
 
+**Update, `phase4/put-write-path` session:** a concrete new manifestation
+of the same underlying risk. Write coordination is now restricted to the
+key's preference list (`PROGRESS.md` decision A3), implemented as a
+receiving node forwarding to a preference-list member when it isn't one
+itself. `forwardPut` sends the original request on, and the target
+recomputes its own preference list using its own locally-configured
+`N_` — if that target's `N_` differs from the forwarding node's, the
+target could legitimately conclude it isn't in the preference list
+either (by its own, different N), tripping the `forwarded=true`
+loop-breaker and failing a write that a uniformly-configured cluster
+would have coordinated successfully. Doesn't change either option under
+consideration, just adds one more concrete failure mode to the pile Q19
+already names.
+
 ### Q20 — Should a coordinator's own local read winning arrival-order ties be an explicit policy, or just an accepted side effect?
 `Get`'s first-arrived-response selection stamps the coordinator's own local
 read (when it's in the preference list) with sequence `0` unconditionally,
@@ -754,3 +768,19 @@ implementation session — `writer_id` field added, `resolveLWW`
 implemented and tested (`test_vector_clocks.cpp`: timestamp-decides-it
 case, timestamp-tie-broken-by-writer_id case, full-tie-keeps-first-seen
 case).
+
+**Update, `phase4/put-write-path` session:** the specific counterexample
+above — a non-replica coordinator building two genuinely `CONCURRENT`
+clocks that share its own `writer_id` — can no longer occur. That
+branch restricted write coordination to the key's preference list (see
+`PROGRESS.md`'s decision A3): a non-replica node now only forwards a
+`Put`, it never calls `buildNewClock`. Combined with B1's existing
+serialization (which already prevents a replica-coordinator from
+producing two colliding clocks for its own sequential writes to one
+key), there may no longer be any path to two genuinely `CONCURRENT`
+clocks sharing a `writer_id` for the same key — which would mean this
+question's tiebreak is complete, not merely narrowed. Recorded here as
+a strong claim worth independently re-deriving before treating it as
+settled, not as a re-resolution — vector clock construction is squarely
+the kind of thing this project's owner verifies personally rather than
+accepting on Claude's say-so.

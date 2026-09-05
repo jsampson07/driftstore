@@ -11,6 +11,7 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <random>
 
 bool NodeServiceImpl::isSelfRemoved() {
     std::lock_guard<std::mutex> lock(table_mutex_);
@@ -24,7 +25,11 @@ grpc::Status NodeServiceImpl::ReplicateWrite(grpc::ServerContext* /*context*/,
         response->set_success(false);
         return grpc::Status::OK;
     }
-    localPut(request->key(), request->value());
+    //localPut(request->key(), request->value());
+    VersionedValue incoming_vv;
+    incoming_vv.value = request->value();
+    incoming_vv.clock = request->vector_clock();
+    storeReplicatedWrite(request->key(), incoming_vv);
     response->set_success(true);
     return grpc::Status::OK;
 }
@@ -36,10 +41,11 @@ grpc::Status NodeServiceImpl::ReplicateRead(grpc::ServerContext* /*context*/,
         response->set_found(false);
         return grpc::Status::OK;
     }
-    std::optional<std::string> value = localGet(request->key());
-    response->set_found(value.has_value());
-    if (value) {
-        response->set_value(*value);
+    std::optional<VersionedValue> vv = localGet(request->key());
+    response->set_found(vv.has_value());
+    if (vv) {
+        response->set_value(vv->value);
+        *response->mutable_vector_clock() = vv->clock;
     }
     return grpc::Status::OK;
 }
@@ -57,60 +63,22 @@ grpc::Status NodeServiceImpl::Put(grpc::ServerContext* /*context*/,
     
     std::string key = request->key();
     std::string value = request->value();
+    driftstore::VectorClock clock = request->context();
     std::vector<std::string> pref_list = preferenceListForKey(key, N_);
-    if (pref_list.size() < W_) {
-        logEvent(EventType::PUT_FAILED, node_id_, "key=" + key + " val=" + value + " W=" + std::to_string(W_) + " preference_list_size=" + std::to_string(static_cast<int>(pref_list.size())));
-        return grpc::Status::OK;
-    }
 
-    std::atomic<int64_t> acks{0}; // IMPORTANT to make it atomic as two threads can read same value, increment ==> LOSE an ack
-
-    for (const auto& peer_id : pref_list) {
-        if (peer_id == node_id_) {
-            localPut(key, value);
-            acks++;
-            break;
+    auto it = std::find(pref_list.begin(), pref_list.end(), node_id_);
+    grpc::Status status;
+    if (it == pref_list.end()) {
+        if (request->forwarded()) {
+            logEvent(EventType::PUT_FAILED, node_id_, "reason=forward_loop_prevented");
+            response->set_success(false);
+            response->set_acks(0);
+            return grpc::Status::OK;
         }
+        return forwardPut(request, pref_list, response);
+    } else {
+        return coordinatePut(key, value, clock, pref_list, response);
     }
-
-    std::vector<std::future<void>> futures;
-    for (const auto& peer_id : pref_list) {
-        if (peer_id == node_id_) {
-            continue;
-        }
-        futures.push_back(std::async(std::launch::async,
-            [this, peer_id, key, value, &acks]() {
-                auto channel = grpc::CreateChannel(peer_id, grpc::InsecureChannelCredentials());
-                std::unique_ptr<driftstore::DriftStoreNode::Stub> stub =
-                    driftstore::DriftStoreNode::NewStub(channel);
-    
-                driftstore::ReplicateWriteRequest req;
-                req.set_key(key);
-                req.set_value(value);
-                driftstore::ReplicateWriteResponse resp;
-                grpc::ClientContext context;
-                grpc::Status status = stub->ReplicateWrite(&context, req, &resp);
-                
-                if (status.ok() && resp.success()) {
-                    acks++;
-                } // if NOT OK or NOT success then either Put RPC failed or wrote to REMOVED node --> treat the same way, do NOT increment 'acks'
-            }));
-    }
-
-    for (auto& f : futures) {
-        f.get();
-    }
-
-    if (acks < W_) {
-        logEvent(EventType::PUT_FAILED, node_id_, "key=" + key + " val=" + value + " W=" + std::to_string(W_) + " acks=" + std::to_string(acks.load()));
-        response->set_success(false);
-        response->set_acks(acks.load());
-        return grpc::Status::OK;
-    }
-    logEvent(EventType::PUT_SUCCEEDED, node_id_, "key=" + key + " val=" + value + " W=" + std::to_string(W_) + " acks=" + std::to_string(acks.load()));
-    response->set_success(true);
-    response->set_acks(acks.load());
-    return grpc::Status::OK;
 }
 
 grpc::Status NodeServiceImpl::Get(grpc::ServerContext* /*context*/,
@@ -136,6 +104,7 @@ grpc::Status NodeServiceImpl::Get(grpc::ServerContext* /*context*/,
         std::string peer_id;
         bool found = false;
         std::string value;
+        driftstore::VectorClock clock;
         int arrival_order = -1;
     };
 
@@ -148,12 +117,13 @@ grpc::Status NodeServiceImpl::Get(grpc::ServerContext* /*context*/,
     logEvent(EventType::GET_INIT, node_id_);
     for (const auto& peer_id : pref_list) {
         if (peer_id == node_id_) {
-            std::optional<std::string> local_value = localGet(key);
+            std::optional<VersionedValue> local_value = localGet(key);
             ReplicaResult r;
             r.peer_id = peer_id;
             r.found = local_value.has_value();
             if (local_value) {
-                r.value = *local_value;
+                r.value = local_value->value;
+                r.clock = local_value->clock;
             }
             r.arrival_order = next_arrival++;
             results.push_back(std::move(r));
@@ -191,6 +161,7 @@ grpc::Status NodeServiceImpl::Get(grpc::ServerContext* /*context*/,
                     r.found = resp.found();
                     if (r.found) {
                         r.value = resp.value();
+                        r.clock = resp.vector_clock();
                     }
                     std::lock_guard<std::mutex> lock(results_mutex);
                     r.arrival_order = next_arrival++;
@@ -221,6 +192,7 @@ grpc::Status NodeServiceImpl::Get(grpc::ServerContext* /*context*/,
     response->set_found(final_r.found);
     if (final_r.found) {
         response->set_value(final_r.value);
+        *response->mutable_context() = final_r.clock;
     }
     response->set_responses(results.size());
     logEvent(EventType::GET_SUCCEEDED, node_id_, "key=" + key);
@@ -236,16 +208,148 @@ std::vector<std::string> NodeServiceImpl::preferenceListForKey(const std::string
     return preferenceList(ring_, mix64(fnv1a64(key)), N, predicate);
 }
 
-void NodeServiceImpl::localPut(const std::string& key, const std::string& value) {
-    std::lock_guard<std::mutex> lock(kv_store_mutex_);
-    kv_store_[key] = value;
+grpc::Status NodeServiceImpl::forwardPut(const driftstore::PutRequest* request,
+                                         const std::vector<std::string>& pref_list,
+                                         driftstore::PutResponse* response) {
+    driftstore::PutRequest forwarded_request = *request; // create a copy of the request
+    forwarded_request.set_forwarded(true);
+
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<std::size_t> dist(0, pref_list.size() - 1);
+    const std::size_t start = dist(gen);
+
+    for (std::size_t i = 0; i < pref_list.size(); ++i) {
+        const std::string& target = pref_list[(start + i) % pref_list.size()];
+        auto channel = grpc::CreateChannel(target, grpc::InsecureChannelCredentials());
+        std::unique_ptr<driftstore::DriftStoreNode::Stub> stub =
+            driftstore::DriftStoreNode::NewStub(channel);
+
+        driftstore::PutResponse target_response;
+        grpc::ClientContext context;
+        grpc::Status status = stub->Put(&context, forwarded_request, &target_response);
+
+        if (status.ok()) {
+            logEvent(EventType::PUT_FORWARDED, node_id_,
+                "key=" + request->key() + " target=" + target);
+            *response = target_response; // relay target's coordinator result straight through
+            return grpc::Status::OK;
+        }
+        logEvent(EventType::PUT_FORWARD_FAILED, node_id_,
+            "key=" + request->key() + " target=" + target + " error=" + status.error_message());
+        // fall through, try (start+i+1) % size next
+    }
+
+    // Every node in pref_list was unreachable
+    logEvent(EventType::PUT_FAILED, node_id_, "key=" + request->key() + " reason=all_forward_targets_unreachable");
+    response->set_success(false);
+    response->set_acks(0);
+    return grpc::Status::OK;
 }
 
-std::optional<std::string> NodeServiceImpl::localGet(const std::string& key) {
+grpc::Status NodeServiceImpl::coordinatePut(const std::string& key,
+                            const std::string& value,
+                            const std::optional<driftstore::VectorClock>& client_context,
+                            const std::vector<std::string>& pref_list,
+                            driftstore::PutResponse* response) {
+    if (pref_list.size() < W_) {
+        logEvent(EventType::PUT_FAILED, node_id_, "key=" + key + " val=" + value + " W=" + std::to_string(W_) + " preference_list_size=" + std::to_string(static_cast<int>(pref_list.size())));
+        return grpc::Status::OK;
+    }
+
+    std::atomic<int64_t> acks{0}; // IMPORTANT to make it atomic as two threads can read same value, increment ==> LOSE an ack
+
+    driftstore::VectorClock clock;
+    for (const auto& peer_id : pref_list) {
+        if (peer_id == node_id_) {
+            clock = commitCoordinatedWrite(key, value, client_context);
+            acks++;
+            break;
+        }
+    }
+
+    std::vector<std::future<void>> futures;
+    for (const auto& peer_id : pref_list) {
+        if (peer_id == node_id_) {
+            continue;
+        }
+        futures.push_back(std::async(std::launch::async,
+            [this, peer_id, key, value, clock, &acks]() {
+                auto channel = grpc::CreateChannel(peer_id, grpc::InsecureChannelCredentials());
+                std::unique_ptr<driftstore::DriftStoreNode::Stub> stub =
+                    driftstore::DriftStoreNode::NewStub(channel);
+    
+                driftstore::ReplicateWriteRequest req;
+                req.set_key(key);
+                req.set_value(value);
+                *req.mutable_vector_clock() = clock;
+                driftstore::ReplicateWriteResponse resp;
+                grpc::ClientContext context;
+                grpc::Status status = stub->ReplicateWrite(&context, req, &resp);
+                
+                if (status.ok() && resp.success()) {
+                    acks++;
+                } // if NOT OK or NOT success then either Put RPC failed or wrote to REMOVED node --> treat the same way, do NOT increment 'acks'
+            }));
+    }
+
+    for (auto& f : futures) {
+        f.get();
+    }
+
+    *response->mutable_context() = clock;
+
+    if (acks < W_) {
+        logEvent(EventType::PUT_FAILED, node_id_, "key=" + key + " val=" + value + " W=" + std::to_string(W_) + " acks=" + std::to_string(acks.load()));
+        response->set_success(false);
+        response->set_acks(acks.load());
+        return grpc::Status::OK;
+    }
+    logEvent(EventType::PUT_SUCCEEDED, node_id_, "key=" + key + " val=" + value + " W=" + std::to_string(W_) + " acks=" + std::to_string(acks.load()));
+    response->set_success(true);
+    response->set_acks(acks.load());
+    return grpc::Status::OK;
+}
+
+std::optional<VersionedValue> NodeServiceImpl::localGet(const std::string& key) {
     std::lock_guard<std::mutex> lock(kv_store_mutex_);
     auto it = kv_store_.find(key);
     if (it != kv_store_.end()) {
         return it->second;
     }
     return std::nullopt;
+}
+
+// Coordinator-side only. Caller (coordinatePut) guarantees node_id_ ∈ pref_list
+// before calling this — that guarantee is what makes the lock meaningful now.
+// One locked read→merge→increment→store, returns the resolved clock.
+driftstore::VectorClock NodeServiceImpl::commitCoordinatedWrite(const std::string& key,
+                                                                const std::string& value,
+                                                                const std::optional<driftstore::VectorClock>& client_context) {
+    std::lock_guard<std::mutex> lock(kv_store_mutex_);
+    // Read
+    auto it = kv_store_.find(key);
+    std::optional<driftstore::VectorClock> local_copy;
+    if (it != kv_store_.end()) {
+        local_copy = it->second.clock;
+    }
+    // Merge + Increment
+    driftstore::VectorClock updated = buildNewClock(client_context, local_copy, node_id_);
+    // Store
+    VersionedValue val;
+    val.value = value;
+    val.clock = updated;
+    // The new clock always dominates the old local copy + client provided context (as it is built from a component-wise max for each)
+    // The value being is stored is on the dominant form of the two clocks, so value will always be the newest updated version
+    kv_store_[key] = val;
+    return updated;
+}
+
+// Replica-side, used by ReplicateWrite. Clock already resolved by the
+// coordinator — no buildNewClock call. Plain overwrite for now;
+// branch 4 adds the dominance check inside this same function.
+void NodeServiceImpl::storeReplicatedWrite(const std::string& key, const VersionedValue& incoming) {
+    std::lock_guard<std::mutex> lock(kv_store_mutex_);
+    kv_store_[key] = incoming;
+    // will perform dominance check again later: if NOT dominant then do not replace, if dominate, replace
 }

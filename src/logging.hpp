@@ -34,6 +34,8 @@ enum class EventType {
     PUT_FAILED,
     PUT_FORWARDED, // logged by the receiving-but-not-coordinating node
     PUT_FORWARD_FAILED, // logged if new receiver fails to connect (before failure handling sequence)
+    CONFLICT_RESOLVED,
+    EQUAL_CLOCK_DETECTED,
 };
 
 inline const char* toString(EventType e) {
@@ -67,6 +69,8 @@ inline const char* toString(EventType e) {
         case EventType::PUT_FAILED: return "PUT_FAILED";
         case EventType::PUT_FORWARDED: return "PUT_FORWARDED";
         case EventType::PUT_FORWARD_FAILED: return "PUT_FORWARD_FAILED";
+        case EventType::CONFLICT_RESOLVED: return "CONFLICT_RESOLVED";
+        case EventType::EQUAL_CLOCK_DETECTED: return "EQUAL_CLOCK_DETECTED";
     }
 }
 

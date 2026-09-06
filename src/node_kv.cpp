@@ -13,6 +13,21 @@
 #include <vector>
 #include <random>
 
+namespace {
+    std::string renderClock(const driftstore::VectorClock& clock) {
+        std::vector<std::pair<std::string, uint64_t>> entries(
+            clock.counters().begin(), clock.counters().end());
+        std::sort(entries.begin(), entries.end());
+        std::string out = "{";
+        for (size_t i = 0; i < entries.size(); ++i) {
+            if (i) out += ",";
+            out += entries[i].first + ":" + std::to_string(entries[i].second);
+        }
+        out += "}";
+        return out;
+    }
+}
+
 bool NodeServiceImpl::isSelfRemoved() {
     std::lock_guard<std::mutex> lock(table_mutex_);
     return table_.entries().at(node_id_).status() == driftstore::REMOVED; // constructor guarantees a self-entry always exists so use at() instead of find() in case this invariant is broken
@@ -189,11 +204,17 @@ grpc::Status NodeServiceImpl::Get(grpc::ServerContext* /*context*/,
         response->set_found(false);
         return grpc::Status::OK;
     }
-    VersionedValue resolved = resolveGetResult(found_versions);
+    GetResolution resolved = resolveGetResult(found_versions);
+    if (resolved.concurrent_count > 1) {
+        logEvent(EventType::CONFLICT_RESOLVED, node_id_, "key=" + key +
+                " concurrent_versions=" + std::to_string(resolved.concurrent_count) +
+                " winner_writer_id=" + resolved.winner.clock.writer_id() +
+                " winner_last_updated=" + std::to_string(resolved.winner.clock.last_updated()));
+    }
     response->set_found(true);
-    response->set_value(resolved.value);
-    *response->mutable_context() = resolved.clock;
-    logEvent(EventType::GET_SUCCEEDED, node_id_, "key=" + key + " val=" + resolved.value);
+    response->set_value(resolved.winner.value);
+    *response->mutable_context() = resolved.winner.clock;
+    logEvent(EventType::GET_SUCCEEDED, node_id_, "key=" + key + " val=" + resolved.winner.value + " winning_clock=" + renderClock(resolved.winner.clock));
     return grpc::Status::OK;
 }
 
@@ -303,7 +324,7 @@ grpc::Status NodeServiceImpl::coordinatePut(const std::string& key,
         response->set_acks(acks.load());
         return grpc::Status::OK;
     }
-    logEvent(EventType::PUT_SUCCEEDED, node_id_, "key=" + key + " val=" + value + " W=" + std::to_string(W_) + " acks=" + std::to_string(acks.load()));
+    logEvent(EventType::PUT_SUCCEEDED, node_id_, "key=" + key + " val=" + value + " clock=" + renderClock(clock) + " W=" + std::to_string(W_) + " acks=" + std::to_string(acks.load()));
     response->set_success(true);
     response->set_acks(acks.load());
     return grpc::Status::OK;
@@ -355,7 +376,17 @@ driftstore::WriteOutcome NodeServiceImpl::storeReplicatedWrite(const std::string
         return driftstore::WriteOutcome::STORED;
     } else {
         ClockComparison res = compareVectorClocks(it->second.clock, incoming.clock);
-        if (res == ClockComparison::DOMINATES || res == ClockComparison::EQUAL) { // local-copy DOMINATES
+        if (res == ClockComparison::EQUAL) { // local-copy DOMINATES
+            // NOTE: if stored and incoming vals are different, then
+            // either one of the writes got silently dropped by ALREADY_CURRENT
+            // OR
+            // a version update (clock) wasn't properly applied (did not increment)
+            logEvent(EventType::EQUAL_CLOCK_DETECTED, node_id_,
+                "key=" + key +
+                " stored_val=" + it->second.value + " incoming_val=" + incoming.value +
+                " clock=" + renderClock(incoming.clock));
+            return driftstore::WriteOutcome::ALREADY_CURRENT;
+        } else if (res == ClockComparison::DOMINATES) {
             return driftstore::WriteOutcome::ALREADY_CURRENT;
         } else {
             kv_store_[key] = incoming;

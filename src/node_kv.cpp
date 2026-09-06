@@ -23,14 +23,15 @@ grpc::Status NodeServiceImpl::ReplicateWrite(grpc::ServerContext* /*context*/,
                             driftstore::ReplicateWriteResponse* response) {
     if (isSelfRemoved()) {
         response->set_success(false);
+        response->set_outcome(driftstore::WriteOutcome::ALREADY_CURRENT); // Not parsed when success = false, but as safety
         return grpc::Status::OK;
     }
-    //localPut(request->key(), request->value());
     VersionedValue incoming_vv;
     incoming_vv.value = request->value();
     incoming_vv.clock = request->vector_clock();
-    storeReplicatedWrite(request->key(), incoming_vv);
+    driftstore::WriteOutcome res = storeReplicatedWrite(request->key(), incoming_vv);
     response->set_success(true);
+    response->set_outcome(res);
     return grpc::Status::OK;
 }
 
@@ -346,10 +347,23 @@ driftstore::VectorClock NodeServiceImpl::commitCoordinatedWrite(const std::strin
 }
 
 // Replica-side, used by ReplicateWrite. Clock already resolved by the
-// coordinator — no buildNewClock call. Plain overwrite for now;
-// branch 4 adds the dominance check inside this same function.
-void NodeServiceImpl::storeReplicatedWrite(const std::string& key, const VersionedValue& incoming) {
+// coordinator — no buildNewClock call. Dominance check inside this function.
+driftstore::WriteOutcome NodeServiceImpl::storeReplicatedWrite(const std::string& key, const VersionedValue& incoming) {
+
     std::lock_guard<std::mutex> lock(kv_store_mutex_);
-    kv_store_[key] = incoming;
+    auto it = kv_store_.find(key);
+    if (it == kv_store_.end()) {
+        // If not a key,val pair, store
+        kv_store_[key] = incoming;
+        return driftstore::WriteOutcome::STORED;
+    } else {
+        ClockComparison res = compareVectorClocks(it->second.clock, incoming.clock);
+        if (res == ClockComparison::DOMINATES || res == ClockComparison::EQUAL) { // local-copy DOMINATES
+            return driftstore::WriteOutcome::ALREADY_CURRENT;
+        } else {
+            kv_store_[key] = incoming;
+            return driftstore::WriteOutcome::STORED;
+        }
+    }
     // will perform dominance check again later: if NOT dominant then do not replace, if dominate, replace
 }

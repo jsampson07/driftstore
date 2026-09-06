@@ -138,7 +138,7 @@ private:
     // Replica-side, used by ReplicateWrite. Clock already resolved by the
     // coordinator — no buildNewClock call. Plain overwrite for now;
     // branch 4 adds the dominance check inside this same function.
-    void storeReplicatedWrite(const std::string& key, const VersionedValue& incoming);
+    driftstore::WriteOutcome storeReplicatedWrite(const std::string& key, const VersionedValue& incoming);
 
     void gossipLoop(int64_t gossip_interval_ms);
 

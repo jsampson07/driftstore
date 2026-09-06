@@ -100,18 +100,15 @@ grpc::Status NodeServiceImpl::Get(grpc::ServerContext* /*context*/,
         return grpc::Status::OK;
     }
 
-    // Used to represent a result (includes arrival_order to track each result)
     struct ReplicaResult {
         std::string peer_id;
         bool found = false;
         std::string value;
         driftstore::VectorClock clock;
-        int arrival_order = -1;
     };
 
     std::vector<ReplicaResult> results;
     std::mutex results_mutex;
-    int next_arrival = 0;
 
     // First check if we can have local read AND no self-RPC
 
@@ -126,7 +123,7 @@ grpc::Status NodeServiceImpl::Get(grpc::ServerContext* /*context*/,
                 r.value = local_value->value;
                 r.clock = local_value->clock;
             }
-            r.arrival_order = next_arrival++;
+            std::lock_guard<std::mutex> lock(results_mutex);
             results.push_back(std::move(r));
             break;
         }
@@ -138,7 +135,7 @@ grpc::Status NodeServiceImpl::Get(grpc::ServerContext* /*context*/,
             continue;
         }
         futures.push_back(std::async(std::launch::async,
-            [this, peer_id, key, &results, &results_mutex, &next_arrival]() {
+            [this, peer_id, key, &results, &results_mutex]() {
                 auto channel = grpc::CreateChannel(peer_id, grpc::InsecureChannelCredentials());
                 std::unique_ptr<driftstore::DriftStoreNode::Stub> stub =
                     driftstore::DriftStoreNode::NewStub(channel);
@@ -165,7 +162,6 @@ grpc::Status NodeServiceImpl::Get(grpc::ServerContext* /*context*/,
                         r.clock = resp.vector_clock();
                     }
                     std::lock_guard<std::mutex> lock(results_mutex);
-                    r.arrival_order = next_arrival++;
                     results.push_back(std::move(r));
                 }
             }));
@@ -175,28 +171,29 @@ grpc::Status NodeServiceImpl::Get(grpc::ServerContext* /*context*/,
         f.get();
     }
 
+    response->set_responses(results.size());
     if (static_cast<int>(results.size()) < R_) {
         logEvent(EventType::GET_FAILED, node_id_, "key=" + key + " R=" + std::to_string(R_) + " responses=" + std::to_string(results.size()));
-        response->set_responses(results.size());
+        response->set_found(false);
         return grpc::Status::OK;
     }
 
-    // We have >= R responses
-    ReplicaResult final_r;
-    int min_arrival_order = INT_MAX;
+    std::vector<VersionedValue> found_versions;
     for (const auto& res : results) {
-        if (res.arrival_order < min_arrival_order) {
-            final_r = res;
-            min_arrival_order = res.arrival_order;
+        if (res.found) {
+            found_versions.push_back(VersionedValue{res.value, res.clock});
         }
     }
-    response->set_found(final_r.found);
-    if (final_r.found) {
-        response->set_value(final_r.value);
-        *response->mutable_context() = final_r.clock;
+    if (found_versions.empty()) {
+        logEvent(EventType::GET_SUCCEEDED, node_id_, "key=" + key + " reason=key_not_found");
+        response->set_found(false);
+        return grpc::Status::OK;
     }
-    response->set_responses(results.size());
-    logEvent(EventType::GET_SUCCEEDED, node_id_, "key=" + key);
+    VersionedValue resolved = resolveGetResult(found_versions);
+    response->set_found(true);
+    response->set_value(resolved.value);
+    *response->mutable_context() = resolved.clock;
+    logEvent(EventType::GET_SUCCEEDED, node_id_, "key=" + key + " val=" + resolved.value);
     return grpc::Status::OK;
 }
 

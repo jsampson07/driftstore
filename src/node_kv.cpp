@@ -178,6 +178,8 @@ grpc::Status NodeServiceImpl::Get(grpc::ServerContext* /*context*/,
                     }
                     std::lock_guard<std::mutex> lock(results_mutex);
                     results.push_back(std::move(r));
+                } else {
+                    markUnreachable(peer_id);
                 }
             }));
     }
@@ -253,6 +255,8 @@ grpc::Status NodeServiceImpl::forwardPut(const driftstore::PutRequest* request,
                 "key=" + request->key() + " target=" + target);
             *response = target_response; // relay target's coordinator result straight through
             return grpc::Status::OK;
+        } else { // did live RPC fail? --> markUnreachable()
+            markUnreachable(target); // target is node we are trying to forward Put to; if call fails, then unreachable (NOT same as "failing" b/c of double-forward for ex.)
         }
         logEvent(EventType::PUT_FORWARD_FAILED, node_id_,
             "key=" + request->key() + " target=" + target + " error=" + status.error_message());
@@ -306,9 +310,13 @@ grpc::Status NodeServiceImpl::coordinatePut(const std::string& key,
                 grpc::ClientContext context;
                 grpc::Status status = stub->ReplicateWrite(&context, req, &resp);
                 
-                if (status.ok() && resp.success()) {
-                    acks++;
-                } // if NOT OK or NOT success then either Put RPC failed or wrote to REMOVED node --> treat the same way, do NOT increment 'acks'
+                if (status.ok()) {
+                    if (resp.success()) {
+                        acks++;
+                    }
+                } else {
+                    markUnreachable(peer_id);
+                }
             }));
     }
 

@@ -36,6 +36,8 @@ enum class EventType {
     PUT_FORWARD_FAILED, // logged if new receiver fails to connect (before failure handling sequence)
     CONFLICT_RESOLVED,
     EQUAL_CLOCK_DETECTED,
+    HINT_STORED,
+    HINT_STORE_FAILED,
 };
 
 inline const char* toString(EventType e) {
@@ -71,6 +73,8 @@ inline const char* toString(EventType e) {
         case EventType::PUT_FORWARD_FAILED: return "PUT_FORWARD_FAILED";
         case EventType::CONFLICT_RESOLVED: return "CONFLICT_RESOLVED";
         case EventType::EQUAL_CLOCK_DETECTED: return "EQUAL_CLOCK_DETECTED";
+        case EventType::HINT_STORED: return "HINT_STORED";
+        case EventType::HINT_STORE_FAILED: return "HINT_STORE_FAILED";
     }
 }
 

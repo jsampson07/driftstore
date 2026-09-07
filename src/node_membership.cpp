@@ -113,6 +113,8 @@ std::optional<driftstore::GossipResponse> NodeServiceImpl::SendGossip(const std:
     } else {
         logEvent(EventType::GOSSIP_FAILED, node_id_,
                  "target=" + peer_address + " error=" + status.error_message());
+        // If cannot gossip with another peer, mark as unreachable
+        markUnreachable(peer_address);
         return std::nullopt;
     }
 }

@@ -266,37 +266,6 @@ would have coordinated successfully. Doesn't change either option under
 consideration, just adds one more concrete failure mode to the pile Q19
 already names.
 
-### Q20 — Should a coordinator's own local read winning arrival-order ties be an explicit policy, or just an accepted side effect?
-`Get`'s first-arrived-response selection stamps the coordinator's own local
-read (when it's in the preference list) with sequence `0` unconditionally,
-because it happens synchronously, before any remote `ReplicateRead` is even
-launched — not because of any comparison against real completion times. So
-whenever the coordinator holds a replica for the key, its own local value
-always wins a disagreement, regardless of whether some other replica's RPC
-would genuinely have completed first. This fell directly out of "local
-first, no self-RPC" — a decision framed entirely around avoiding a loopback
-RPC and giving the local write credit toward `W`/`R` — not out of any
-decision about how ties should resolve when replicas disagree.
-
-*Status:* unresolved, not blocking — surfaced while reviewing the completed
-`Get` handler, not acted on. Worth deciding explicitly whether this is
-acceptable (the coordinator's own copy is *a* valid replica's answer, no
-more or less legitimate than any other single reply under the current naive
-first-arrived floor) or worth changing, especially once Phase 6's
-read-repair starts caring about which replica's value systematically wins.
-*Context:* raised while reviewing the `Get` coordinator handler, Phase 3
-implementation session.
-
-**Update, Phase 3 checkpoint session:** sharpened, not resolved. Self's
-`arrival_order=0` is a **structural guarantee**, not a probabilistic
-tendency — it's assigned synchronously, before any remote `std::async`
-future is even launched, so no remote reply could beat it even
-hypothetically, regardless of real network speed. Also: moving the
-self-check textually into the general loop (one candidate fix) is
-necessary but not sufficient by itself — local would still resolve
-before any remote call unless it's *also* dispatched via `std::async` to
-genuinely race in real time. Still open either way.
-
 ### Q21 — No RPC deadline on the coordinator's internal `Put`/`Get` fan-out
 Neither `Put` nor `Get`'s internal `ReplicateWrite`/`ReplicateRead` calls
 (the ones issued from inside the `std::async` fan-out lambdas) ever set a
@@ -392,6 +361,34 @@ key for every `CONCURRENT` pair, this question is about the trustworthiness
 of `last_updated` itself once LWW is consulted at all. Both are now
 accepted-and-named on the same terms, not stacked into a false sense that
 one covers the other.
+
+### Q26 — Neither the logs nor the CLI expose `last_updated`/`writer_id` for a stored clock
+Surfaced while building both of branch 7/8's harnesses. `renderClock()`
+(`node_kv.cpp`) and `client.cpp`'s `clockToString()` both render only the
+counters map — sorted `{node:count,...}`, nothing else. Neither
+`PUT_SUCCEEDED`/`GET_SUCCEEDED`'s new `clock=` field nor
+`--replicate-read`'s `clock=` output carries `last_updated` or
+`writer_id`, and there's no separate flag exposing either. Practical
+consequence: `test_conflict_scenario_race.sh` can confirm a real
+two-coordinator race produces a genuine conflict and that it resolves to
+one of the two legitimate values, but cannot check that it resolved to
+the *correct* one under LWW — there's no ground truth available anywhere
+to check the winner against.
+
+**Not yet resolved — open design call, not just a missing feature.**
+Closing this needs `renderClock`/`clockToString` extended to include both
+fields (mechanical), but also raises a question adjacent to B1/B2: is
+exposing a write's exact wall-clock timestamp and coordinating node to
+any caller who can run `--get`/`--replicate-read` fine for a debugging
+CLI, or does it deserve more thought before widening what's observable?
+Leaning toward "fine to expose, this is a debugging CLI, not the client
+API `DriftClient` wraps" — but that's a design call, not decided yet.
+
+*Status:* open — blocks verifying LWW winner-correctness under any
+harness that uses real (non-injected) concurrent writes.
+*Context:* raised during `phase4/conflict-scenario-harness` (branch 8),
+while scoping what `test_conflict_scenario_race.sh` could and couldn't
+verify.
 
 ---
 
@@ -708,6 +705,17 @@ by a failing assertion that turned out to be checking for something
 deliberately absent, not something broken.
 *Resolved during:* same session.
 
+**Update, `phase4/observability-logging` session:** this resolution's
+"no routine logging" stance now has a narrow, deliberate exception —
+`storeReplicatedWrite` (reached via `ReplicateWrite`) gained a
+`logEvent` call for `EQUAL_CLOCK_DETECTED`. Not a reversal of this
+decision: that event is an anomaly a coordinator's own log genuinely
+cannot see on its own (it has no visibility into what a specific remote
+replica's dominance check decided), which is different from the routine
+success/failure reporting this question was actually about. Noted here
+so this entry doesn't read as contradicted by `node_kv.cpp`'s current
+code.
+
 ### Q24 — Exact-timestamp-tie tiebreak for Phase 4's LWW conflict resolution
 Phase 4's LWW tiebreak (see `PROGRESS.md`'s Phase 4 design section, decision
 B2) resolves a genuinely-concurrent vector-clock comparison by comparing
@@ -784,3 +792,50 @@ a strong claim worth independently re-deriving before treating it as
 settled, not as a re-resolution — vector clock construction is squarely
 the kind of thing this project's owner verifies personally rather than
 accepting on Claude's say-so.
+
+### Q20 — Should a coordinator's own local read winning arrival-order ties be an explicit policy, or just an accepted side effect?
+`Get`'s first-arrived-response selection stamped the coordinator's own
+local read (when it was in the preference list) with sequence `0`
+unconditionally, because it happened synchronously, before any remote
+`ReplicateRead` was even launched — not because of any comparison
+against real completion times. So whenever the coordinator held a
+replica for the key, its own local value always won a disagreement,
+regardless of whether some other replica's RPC would genuinely have
+completed first. This fell directly out of "local first, no self-RPC" —
+a decision framed entirely around avoiding a loopback RPC and giving the
+local write credit toward `W`/`R` — not out of any decision about how
+ties should resolve when replicas disagree.
+
+**Update, Phase 3 checkpoint session:** sharpened, not resolved. Self's
+`arrival_order=0` was a **structural guarantee**, not a probabilistic
+tendency — assigned synchronously, before any remote `std::async` future
+was even launched, so no remote reply could beat it even hypothetically,
+regardless of real network speed.
+
+**Resolution:** superseded wholesale, not patched — exactly as Phase 4's
+design conversation anticipated (see `PROGRESS.md`'s "What Phase 4
+replaces in existing code"). `phase4/get-read-path` removed
+`arrival_order` entirely; `Get` now filters collected replica responses
+to the found-only subset and runs `resolveGetResult`
+(`computeFrontier` + `resolveLWW`) over that subset, so the winning
+value is whichever one is actually causally current (or wins the B2/B3
+LWW tiebreak on genuine concurrency), never whichever one happened to be
+appended to the results vector first. The coordinator's own local copy
+now wins only when it's actually the dominant or resolved-current
+value — not structurally, by construction, regardless of what any other
+replica holds.
+
+**New, narrower non-determinism introduced by the fix, accepted rather
+than chased further:** with `arrival_order` gone, the order entries land
+in the results vector is now whichever order the fan-out threads happen
+to acquire `results_mutex` — nondeterministic across runs. This only
+matters for `resolveLWW`'s full-tie fallback (identical `last_updated`
+*and* identical `writer_id`, first-seen-wins, see Q24) — already
+accepted there as a vanishingly narrow residual case. "First-seen" now
+means "first-to-grab-the-lock" rather than anything meaningful, which is
+a smaller and more honestly-scoped problem than the one this question
+originally raised, not a new one.
+
+*Context:* raised while reviewing the `Get` coordinator handler, Phase 3
+implementation session; sharpened during the Phase 3 checkpoint session;
+resolved during `phase4/get-read-path` (branch 5/9) implementation.

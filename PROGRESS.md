@@ -13,7 +13,7 @@
 | 1 | Gossip membership + local failure detection | ✅ Done |
 | 2 | Consistent hashing ring + virtual nodes | ✅ Done |
 | 3 | Any-node coordinator + basic quorum read/write | ✅ Done |
-| 4 | Vector clocks + conflict detection | ⬜ Design decided, implementation in progress — branch 8/9 merged |
+| 4 | Vector clocks + conflict detection | ✅ Done |
 | 5 | Hinted handoff | ⬜ Not started |
 | 6 | Read-repair | ⬜ Not started |
 | 7 | Dashboard | ⬜ Not started |

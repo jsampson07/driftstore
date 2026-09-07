@@ -4,6 +4,7 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include <algorithm>
 #include <atomic>
 #include <climits> // Required for INT_MAX
 #include <future>
@@ -80,9 +81,10 @@ grpc::Status NodeServiceImpl::Put(grpc::ServerContext* /*context*/,
     std::string key = request->key();
     std::string value = request->value();
     driftstore::VectorClock clock = request->context();
-    std::vector<std::string> pref_list = preferenceListForKey(key, N_);
+    std::vector<PreferenceListEntry> pref_list = preferenceListForKey(key, N_);
 
-    auto it = std::find(pref_list.begin(), pref_list.end(), node_id_);
+    auto it = std::find_if(pref_list.begin(), pref_list.end(),
+        [this](const PreferenceListEntry& entry) { return entry.node_id == node_id_; });
     grpc::Status status;
     if (it == pref_list.end()) {
         if (request->forwarded()) {
@@ -108,7 +110,7 @@ grpc::Status NodeServiceImpl::Get(grpc::ServerContext* /*context*/,
     
     std::string key = request->key();
     // Generate preference list for this key
-    std::vector<std::string> pref_list = preferenceListForKey(key, N_);
+    std::vector<PreferenceListEntry> pref_list = preferenceListForKey(key, N_);
     // If pref list size < R then read will ALWAYS fail
     if (static_cast<int>(pref_list.size()) < R_) {
         logEvent(EventType::GET_FAILED, node_id_, "key=" + key + " R=" + std::to_string(R_) + " preference_list_size=" + std::to_string(pref_list.size()));
@@ -128,11 +130,11 @@ grpc::Status NodeServiceImpl::Get(grpc::ServerContext* /*context*/,
     // First check if we can have local read AND no self-RPC
 
     logEvent(EventType::GET_INIT, node_id_);
-    for (const auto& peer_id : pref_list) {
-        if (peer_id == node_id_) {
+    for (const auto& entry : pref_list) {
+        if (entry.node_id == node_id_) {
             std::optional<VersionedValue> local_value = localGet(key);
             ReplicaResult r;
-            r.peer_id = peer_id;
+            r.peer_id = entry.node_id;
             r.found = local_value.has_value();
             if (local_value) {
                 r.value = local_value->value;
@@ -145,12 +147,12 @@ grpc::Status NodeServiceImpl::Get(grpc::ServerContext* /*context*/,
     }
 
     std::vector<std::future<void>> futures;
-    for (const auto& peer_id : pref_list) {
-        if (peer_id == node_id_) {
+    for (const auto& entry : pref_list) {
+        if (entry.node_id == node_id_) {
             continue;
         }
         futures.push_back(std::async(std::launch::async,
-            [this, peer_id, key, &results, &results_mutex]() {
+            [this, peer_id = entry.node_id, key, &results, &results_mutex]() {
                 auto channel = grpc::CreateChannel(peer_id, grpc::InsecureChannelCredentials());
                 std::unique_ptr<driftstore::DriftStoreNode::Stub> stub =
                     driftstore::DriftStoreNode::NewStub(channel);
@@ -220,7 +222,7 @@ grpc::Status NodeServiceImpl::Get(grpc::ServerContext* /*context*/,
     return grpc::Status::OK;
 }
 
-std::vector<std::string> NodeServiceImpl::preferenceListForKey(const std::string& key, int N) {
+std::vector<PreferenceListEntry> NodeServiceImpl::preferenceListForKey(const std::string& key, int N) {
     std::unordered_set<std::string> unreachable_peers = unreachableSnapshot();
     auto predicate = [unreachable_peers = std::move(unreachable_peers)](const std::string& node_id) {
         return unreachable_peers.find(node_id) == unreachable_peers.end();  // true = reachable = passes
@@ -230,7 +232,7 @@ std::vector<std::string> NodeServiceImpl::preferenceListForKey(const std::string
 }
 
 grpc::Status NodeServiceImpl::forwardPut(const driftstore::PutRequest* request,
-                                         const std::vector<std::string>& pref_list,
+                                         const std::vector<PreferenceListEntry>& pref_list,
                                          driftstore::PutResponse* response) {
     driftstore::PutRequest forwarded_request = *request; // create a copy of the request
     forwarded_request.set_forwarded(true);
@@ -241,7 +243,7 @@ grpc::Status NodeServiceImpl::forwardPut(const driftstore::PutRequest* request,
     const std::size_t start = dist(gen);
 
     for (std::size_t i = 0; i < pref_list.size(); ++i) {
-        const std::string& target = pref_list[(start + i) % pref_list.size()];
+        const std::string& target = pref_list[(start + i) % pref_list.size()].node_id;
         auto channel = grpc::CreateChannel(target, grpc::InsecureChannelCredentials());
         std::unique_ptr<driftstore::DriftStoreNode::Stub> stub =
             driftstore::DriftStoreNode::NewStub(channel);
@@ -273,7 +275,7 @@ grpc::Status NodeServiceImpl::forwardPut(const driftstore::PutRequest* request,
 grpc::Status NodeServiceImpl::coordinatePut(const std::string& key,
                             const std::string& value,
                             const std::optional<driftstore::VectorClock>& client_context,
-                            const std::vector<std::string>& pref_list,
+                            const std::vector<PreferenceListEntry>& pref_list,
                             driftstore::PutResponse* response) {
     if (pref_list.size() < W_) {
         logEvent(EventType::PUT_FAILED, node_id_, "key=" + key + " val=" + value + " W=" + std::to_string(W_) + " preference_list_size=" + std::to_string(static_cast<int>(pref_list.size())));
@@ -283,8 +285,8 @@ grpc::Status NodeServiceImpl::coordinatePut(const std::string& key,
     std::atomic<int64_t> acks{0}; // IMPORTANT to make it atomic as two threads can read same value, increment ==> LOSE an ack
 
     driftstore::VectorClock clock;
-    for (const auto& peer_id : pref_list) {
-        if (peer_id == node_id_) {
+    for (const auto& entry : pref_list) {
+        if (entry.node_id == node_id_) {
             clock = commitCoordinatedWrite(key, value, client_context);
             acks++;
             break;
@@ -292,12 +294,12 @@ grpc::Status NodeServiceImpl::coordinatePut(const std::string& key,
     }
 
     std::vector<std::future<void>> futures;
-    for (const auto& peer_id : pref_list) {
-        if (peer_id == node_id_) {
+    for (const auto& entry : pref_list) {
+        if (entry.node_id == node_id_) {
             continue;
         }
         futures.push_back(std::async(std::launch::async,
-            [this, peer_id, key, value, clock, &acks]() {
+            [this, peer_id = entry.node_id, key, value, clock, &acks]() {
                 auto channel = grpc::CreateChannel(peer_id, grpc::InsecureChannelCredentials());
                 std::unique_ptr<driftstore::DriftStoreNode::Stub> stub =
                     driftstore::DriftStoreNode::NewStub(channel);

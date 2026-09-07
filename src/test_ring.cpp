@@ -83,8 +83,8 @@ void testRingAndPrefList() {
     assert(ring.at(t1) == "peerB");
 
     auto prefs = preferenceList(ring, t0, 1);
-    printf("%s\n", prefs[0].c_str());
-    assert(prefs.size() == 1 && prefs[0] == "peerB");
+    printf("%s\n", prefs[0].node_id.c_str());
+    assert(prefs.size() == 1 && prefs[0].node_id == "peerB");
 
     printf("test 1 (new-node ring insert): PASS\n");
 }
@@ -105,24 +105,87 @@ void testReachabilityPredicate() {
     };
     // Generate preferenceList and see if the "reachability" status is enforced (properly excluding node B)
     auto prefs1 = preferenceList(ring, key_hash, /*N=*/2, excludeB);
-    for (const auto& node_id : prefs1) {
-        assert(node_id != "B");
+    for (const auto& entry : prefs1) {
+        assert(entry.node_id != "B");
     }
     printf("test predicate case 1 (exclude one node, walk continues past it): PASS\n");
 
     auto onlyA = [](const std::string& node_id) {
         return node_id == "A";
     };
-    std::vector<std::string> prefs2 = preferenceList(ring, key_hash, 2, onlyA);
+    std::vector<PreferenceListEntry> prefs2 = preferenceList(ring, key_hash, 2, onlyA);
     assert(prefs2.size() == 1);
-    assert(prefs2[0] == "A");
+    assert(prefs2[0].node_id == "A");
     printf("test predicate case 2 (short list when predicate excludes below N): PASS\n");
+}
+
+/**
+Manually create ring membership
+Mark A, C as down via is_reachable predicate
+When constructing preference list, should have B as "natural" member, and then D/E as temporary nodes for A/C respectively
+Test to make sure that D/E entries correspond with A/C respectively */
+void testHintPairing() {
+    std::map<uint64_t, std::string> ring = {
+        {10, "A"}, {20, "B"}, {30, "C"}, {40, "D"}, {50, "E"}
+    };
+    std::unordered_set<std::string> down = {"A", "C"};
+    auto is_reachable = [&down](const std::string& n) { return down.find(n) == down.end(); };
+
+    auto result = preferenceList(ring, 0, 3, is_reachable);
+
+    assert(result.size() == 3);
+    assert(result[0].node_id == "B" && !result[0].hint_for_node_id.has_value());
+    assert(result[1].node_id == "D" && result[1].hint_for_node_id.has_value() && *result[1].hint_for_node_id == "A");
+    assert(result[2].node_id == "E" && result[2].hint_for_node_id.has_value() && *result[2].hint_for_node_id == "C");
+
+    printf("test hint pairing (FIFO skip/substitute): PASS\n");
+}
+
+// Test to see if nodes are only added on their first ever visit in the ring loop
+// NO duplicate nodes with consecutive virtual nodes for same physical node
+void testVnodeDuplicateDoesNotStealHintSlot() {
+    // A owns two consecutive tokens before any other physical node appears.
+    // Without the seen-tracks-rejections fix, A's second token steals the
+    // substitute slot that should have gone to X.
+    std::map<uint64_t, std::string> ring = {
+        {10, "A"}, {15, "A"}, {20, "B"}, {30, "X"}, {40, "D"}, {50, "E"}
+    };
+    std::unordered_set<std::string> down = {"A", "X"};
+    auto is_reachable = [&down](const std::string& n) { return down.find(n) == down.end(); };
+
+    auto result = preferenceList(ring, 0, 3, is_reachable);
+
+    assert(result.size() == 3);
+    assert(result[0].node_id == "B" && !result[0].hint_for_node_id.has_value());
+    assert(result[1].node_id == "D" && *result[1].hint_for_node_id == "A");
+    assert(result[2].node_id == "E" && *result[2].hint_for_node_id == "X"); // must not be dropped AND should NOT be "A"
+
+    printf("test vnode duplicate does not double-consume a hint slot: PASS\n");
+}
+
+void testRingExhaustionDegradesToShortList() {
+    std::map<uint64_t, std::string> ring = {
+        {10, "A"}, {20, "B"}, {30, "C"}
+    };
+    std::unordered_set<std::string> down = {"A"};
+    auto is_reachable = [&down](const std::string& n) { return down.find(n) == down.end(); };
+
+    auto result = preferenceList(ring, 0, 3, is_reachable);
+
+    assert(result.size() == 2);
+    assert(result[0].node_id == "B");
+    assert(result[1].node_id == "C");
+
+    printf("test ring exhaustion degrades to short list, no infinite loop: PASS\n");
 }
 
 int main() {
     testRingAndPrefList();
     testKillAndReboot();
     testReachabilityPredicate();
+    testHintPairing();
+    testVnodeDuplicateDoesNotStealHintSlot();
+    testRingExhaustionDegradesToShortList();
 
     return 0;
 }

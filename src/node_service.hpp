@@ -2,6 +2,7 @@
 
 #include "driftstore.grpc.pb.h"
 #include "vector_clock.hpp"
+#include "ring.hpp"
 
 #include <grpcpp/grpcpp.h>
 
@@ -101,7 +102,7 @@ public:
     */
     driftstore::MembershipTable applyGossip(const driftstore::MembershipTable& incoming);
 
-    std::vector<std::string> preferenceListForKey(const std::string& key, int N);
+    std::vector<PreferenceListEntry> preferenceListForKey(const std::string& key, int N);
 
     bool bootstrapFromSeed(const std::vector<std::string>& seeds);
 
@@ -130,13 +131,13 @@ private:
     std::optional<VersionedValue> localGet(const std::string& key);
 
     grpc::Status forwardPut(const driftstore::PutRequest* request,
-                            const std::vector<std::string>& pref_list,
+                            const std::vector<PreferenceListEntry>& pref_list,
                             driftstore::PutResponse* response);
 
     grpc::Status coordinatePut(const std::string& key,
                                 const std::string& value,
                                 const std::optional<driftstore::VectorClock>& client_context,
-                                const std::vector<std::string>& pref_list,
+                                const std::vector<PreferenceListEntry>& pref_list,
                                 driftstore::PutResponse* response);
 
     // Coordinator-side only. Caller (coordinatePut) guarantees node_id_ ∈ pref_list

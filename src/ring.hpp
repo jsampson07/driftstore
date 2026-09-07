@@ -7,6 +7,8 @@
 #include <unordered_set>
 #include <vector>
 #include <functional>
+#include <optional>
+#include <queue>
 
 struct PreferenceListEntry {
     std::string node_id;
@@ -69,15 +71,18 @@ inline void mergeInto(driftstore::MembershipTable& local,
     }
 }
 
-inline std::vector<std::string> preferenceList(const std::map<uint64_t, std::string>& ring,
+inline std::vector<PreferenceListEntry> preferenceList(const std::map<uint64_t, std::string>& ring,
                                                 uint64_t key_hash,
                                                 int N,
                                                 std::function<bool(const std::string&)> is_reachable = [](const std::string&) { return true; }) {
-    std::vector<std::string> preference_list;
+    std::vector<PreferenceListEntry> preference_list;
     if (ring.empty()) {
         return preference_list;
     }
     std::unordered_set<std::string> seen;
+    std::queue<std::string> pending_hints; // FIFO: natural owners ONLY that are skipped for reachability
+                                            // other aspect of "hints" will be distributed on ReplicateWrite failure
+    int natural_count = 0;
     auto it = ring.upper_bound(key_hash);
     if (it == ring.end()) {
         // start iterating from the beginning of the map
@@ -86,10 +91,15 @@ inline std::vector<std::string> preferenceList(const std::map<uint64_t, std::str
     size_t visited = 0;
     while (true) {
         const std::string& candidate = it->second;
-        if (is_reachable(candidate)) {
-            if (seen.find(candidate) == seen.end()) { // if candidate is UNIQUE physical node
-                seen.insert(candidate);
-                preference_list.push_back(candidate);
+        if (seen.insert(candidate).second) { // already does the check for us if seen or not
+            if (natural_count < N) {
+                natural_count++;
+                if (is_reachable(candidate)) preference_list.push_back({candidate, std::nullopt});
+                else pending_hints.push(candidate);
+            } else if (is_reachable(candidate) && !pending_hints.empty()) {
+                std::string hint_target = pending_hints.front();
+                pending_hints.pop();
+                preference_list.push_back({candidate, hint_target});
             }
         }
         ++visited;

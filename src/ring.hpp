@@ -8,6 +8,11 @@
 #include <vector>
 #include <functional>
 
+struct PreferenceListEntry {
+    std::string node_id;
+    std::optional<std::string> hint_for_node_id; // nullopt - natural owner, else - the skipped node this node_id covers
+};
+
 inline uint64_t mix64(uint64_t x) {
     x ^= x >> 30;
     x *= 0xbf58476d1ce4e5b9ULL;

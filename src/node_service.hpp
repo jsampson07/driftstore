@@ -14,6 +14,14 @@
 #include <unordered_set>
 #include <vector>
 
+struct HeldHint {
+    std::string key;
+    // Normalize VersionedValue in appropriate places
+    std::string value;
+    driftstore::VectorClock clock;
+    int64_t created_at;
+};
+
 std::string dumpTable(const driftstore::MembershipTable& table);
 std::string dumpRing(const std::map<uint64_t, std::string>& ring);
 
@@ -107,6 +115,10 @@ private:
     std::mutex unreachable_peers_mutex_;
     std::unordered_map<std::string, VersionedValue> kv_store_;
     std::mutex kv_store_mutex_;
+    // Hints container is keyed by node_id to answer "which hints are held for Node X" when Node X responds again
+    std::unordered_map<std::string, std::vector<HeldHint>> hints_by_target_;
+    std::mutex hints_mutex_;
+    
     int64_t N_;
     int64_t W_;
     int64_t R_;

@@ -69,6 +69,8 @@ message ReplicateWriteRequest {
     string key = 1;
     string value = 2;
     VectorClock vector_clock = 3;
+    optional string hint_for_node_id = 4; // each ReplicateWrite will be tagged with a "hint_for"
+                                            // if a node is paired with one, inside of Get fan-out, will populate
 }
 
 message ReplicateWriteResponse {

@@ -42,6 +42,23 @@ grpc::Status NodeServiceImpl::ReplicateWrite(grpc::ServerContext* /*context*/,
         response->set_outcome(driftstore::WriteOutcome::ALREADY_CURRENT); // Not parsed when success = false, but as safety
         return grpc::Status::OK;
     }
+
+    // If the key is being stored as a hint on curr node
+    if (request->has_hint_for_node_id()) {
+        HeldHint hint;
+        hint.key = request->key();
+        hint.value = request->value();
+        hint.clock = request->vector_clock();
+        hint.created_at = nowMillis();
+        {
+            std::lock_guard<std::mutex> lock(hints_mutex_);
+            hints_for_target_[request->hint_for_node_id()].push_back(std::move(hint));
+        }
+        logEvent(EventType::HINT_STORED, node_id_, "key=" + hint.key + " for=" + request->hint_for_node_id());
+        response->set_success(true);
+        response->set_outcome(driftstore::WriteOutcome::STORED);
+        return grpc::Status::OK;
+    }
     VersionedValue incoming_vv;
     incoming_vv.value = request->value();
     incoming_vv.clock = request->vector_clock();

@@ -13,7 +13,7 @@
 | 1 | Gossip membership + local failure detection | ✅ Done |
 | 2 | Consistent hashing ring + virtual nodes | ✅ Done |
 | 3 | Any-node coordinator + basic quorum read/write | ✅ Done |
-| 4 | Vector clocks + conflict detection | ⬜ Design decided, implementation in progress — branch 3/9 merged |
+| 4 | Vector clocks + conflict detection | ⬜ Design decided, implementation in progress — branch 8/9 merged |
 | 5 | Hinted handoff | ⬜ Not started |
 | 6 | Read-repair | ⬜ Not started |
 | 7 | Dashboard | ⬜ Not started |
@@ -1688,7 +1688,7 @@ project's goal; the client/server boundary was never in scope to invert.
 
 ---
 
-## Phase 4 — Vector clocks + conflict detection (design decided; implementation in progress — branch 3/9 merged)
+## Phase 4 — Vector clocks + conflict detection (design decided; implementation in progress — branch 8/9 merged)
 
 Design conversation followed by staged implementation across nine
 git branches, treated as sequential checkpoints (branch → PR → merge to
@@ -1707,6 +1707,12 @@ responses and returns one. Phase 4's comparison logic is what makes that
 detection possible for the first time. Q20 is effectively superseded by this
 phase's design, not resolved by it — `Get`'s selection logic is being
 replaced wholesale, not patched.
+
+**Update:** as of branch 5 (`phase4/get-read-path`), this is no longer a
+forward-looking statement — `arrival_order` has actually been removed and
+Q20 has moved to `OPEN_QUESTIONS.md`'s Resolved section. Left the
+paragraph above as originally written since it correctly predicted the
+shape of the fix before it existed.
 
 ### Decision A1 — Clock construction on `Put`
 Coordinator merges (component-wise max) the client-supplied context *and*
@@ -2159,28 +2165,41 @@ observability last since they consume the mechanism rather than define it.
    `coordinatePut`/`forwardPut` per decision A3 (write coordination
    restricted to the preference list — new this branch, not in the
    original roadmap). Full write-up in "Branch 3 close-out" below.
-4. **`phase4/replicate-write-defensive-check`** — ⬜ Not started. Update
-   `ReplicateWrite`'s handler per the finalized C1 semantics above:
-   dominance check, `STORED`/`ALREADY_CURRENT` outcome, concurrent-with-
-   existing still stores (no local arbitration). Verify ack-counting is
-   unaffected by `outcome`.
-5. **`phase4/get-read-path`** — ⬜ Not started. Replace `Get`'s
-   arrival-order-wins logic (Q20, fully superseded) with
-   `resolveGetResult` over collected replica responses; populate
-   `GetResponse.context`.
-6. **`phase4/driftclient-context-roundtrip`** — ⬜ Not started.
+4. **`phase4/replicate-write-defensive-check`** — ✅ **Merged.**
+   `storeReplicatedWrite` runs the C1 dominance check: strict dominance
+   by the existing copy, or an exact-clock replay (`EQUAL`), refuses
+   (`ALREADY_CURRENT`); everything else, including genuinely concurrent
+   writes, stores (`STORED`), no local arbitration. `ReplicateWriteResponse.outcome`
+   populated on every path. Full write-up in "Branch 4 close-out" below.
+5. **`phase4/get-read-path`** — ✅ **Merged.** `Get`'s arrival-order-wins
+   logic (Q20, now resolved — see `OPEN_QUESTIONS.md`) replaced with
+   `resolveGetResult` over the found-only subset of collected replica
+   responses; quorum gating still runs on total responses first, before
+   the found/not-found split, to preserve the `W+R>N` overlap guarantee.
+   Full write-up in "Branch 5 close-out" below.
+6. **`phase4/driftclient-context-roundtrip`** — ✅ **Merged.**
    `DriftClient` holds the last-seen context per key and round-trips it
-   through `put()`/`get()`; update the CLI driver to exercise it.
-7. **`phase4/observability-logging`** — ⬜ Not started. `clock=` on
-   existing `PUT_SUCCEEDED`/`GET_SUCCEEDED` lines; new `CONFLICT_RESOLVED`
-   event (fires only on genuine concurrency) and `EQUAL_CLOCK_DETECTED`
-   canary (should essentially never fire if B1's critical section is
-   correct).
-8. **`phase4/conflict-scenario-harness`** — ⬜ Not started. Scripted,
-   reproducible two-coordinator concurrent-write scenario, correlated
-   against `CONFLICT_RESOLVED`, same pattern as
-   `test_coordinator_rotation.sh`.
-9. **`phase4/close-out-docs`** — ⬜ Not started. Flip Phase 4 to done in
+   through `put()`/`get()`; CLI driver updated to print it and to
+   exercise `get()` for the first time. Full write-up in "Branch 6
+   close-out" below.
+7. **`phase4/observability-logging`** — ✅ **Merged.** `clock=` added to
+   `PUT_SUCCEEDED`/`GET_SUCCEEDED` via a new `renderClock()` helper (same
+   pattern as `node.cpp`'s `dumpTable()`). `resolveGetResult` now returns
+   a `GetResolution{winner, concurrent_count}` struct so `Get`'s handler
+   can log `CONFLICT_RESOLVED` without recomputing `computeFrontier`
+   itself. `EQUAL_CLOCK_DETECTED` canary fires only from
+   `storeReplicatedWrite`'s own `EQUAL` branch (split out from
+   `DOMINATES`) — deliberately not from `computeFrontier`'s dedup step,
+   which is a different, expected `EQUAL` case. Full write-up in "Branch
+   7 close-out" below.
+8. **`phase4/conflict-scenario-harness`** — ✅ **Merged.** Real
+   two-coordinator race (`test_conflict_scenario_race.sh`): two `Put()`s
+   to a fresh key raced through two different coordinators, up to 20
+   retries, ground-truth replica divergence (direct `--replicate-read`,
+   bypassing `Get`) checked against `CONFLICT_RESOLVED` on every attempt
+   regardless of whether that attempt actually diverged. Full write-up in
+   "Branch 8 close-out" below.
+9. **`phase4/close-out-docs`** — ✅ **Merged.** Flip Phase 4 to done in
    this file, resolve/update `OPEN_QUESTIONS.md` entries this phase
    touched (Q20 closes here; Q24/Q25 likely stay open), explain-from-memory
    checkpoint before Phase 5.
@@ -2347,6 +2366,329 @@ squarely this project's design-it-yourself territory.
 **Verification:** `harness/test_coordinator_rotation.sh` passes.
 `harness/smoke_test.sh` and `harness/test_replica_boundary.sh` not yet
 re-run against this branch's changes.
+
+---
+
+### Branch 4 close-out — `phase4/replicate-write-defensive-check`
+Merged to `main`. `storeReplicatedWrite` now runs the C1 dominance check
+under the same single-critical-section shape `commitCoordinatedWrite`
+already established: one `kv_store_mutex_` lock spanning read existing
+entry → `compareVectorClocks` → conditional store. Branch outcome:
+existing copy strictly `DOMINATES` incoming, or clocks are `EQUAL` (an
+exact-clock replay) → refuse, `ALREADY_CURRENT`, no overwrite; incoming
+`DOMINATES` existing, or `CONCURRENT` → store, `STORED`, no local
+arbitration on genuine conflict (per C1's explicit rejection of
+per-replica independent resolution). `EQUAL`'s outcome was the one
+branch C1's original text left unassigned — resolved during this
+branch: grouped with the dominance-refuse case, since `EQUAL` should
+only arise from a retried write and nothing causally new has arrived
+either way.
+
+`ReplicateWriteResponse.outcome` is now populated on every path,
+including an explicit `ALREADY_CURRENT` default on the self-removed
+refusal branch (would otherwise default to `STORED`, proto3's
+zero-value — misleading if ever logged; caught in review). `success`
+keeps its Q16 meaning unchanged (self-removed refusal only);
+`coordinatePut`'s ack-counting only reads `success()`, confirmed
+unaffected by `outcome`.
+
+**Test coverage added alongside this branch, not originally called out
+on its roadmap line:** `client.cpp`'s `--replicate-write` gained
+`--clock=<node>:<counter>[,...]` to construct specific vector clocks
+directly at the RPC boundary (bypassing `coordinatePut`/`buildNewClock`
+entirely); `--replicate-read` now also prints the stored clock, so a
+refusal can be confirmed by reading back unchanged state rather than
+trusting the outcome label alone. `test_replica_boundary.sh` gained a
+new test (inserted *before* the self-removal test, which must run last —
+a `REMOVED` node refuses everything and would mask these results)
+covering all four `ClockComparison` outcomes on one threaded key,
+including a deliberate exact-clock replay sent with a *different* value
+so the "unchanged" assertion can't pass by coincidence.
+
+**Bugs caught before landing, across several rounds against actual
+compiler output, not code-review alone:** a `drifstore` namespace typo;
+comparing against an undeclared `val` instead of the found iterator's
+`it->second`; `incoming->clock` instead of `.clock` (a reference, not a
+pointer); a missing `return` on the new-key branch of
+`storeReplicatedWrite` (control reaching the end of a non-`void`
+function); an earlier draft where `ReplicateWrite`'s
+`response->set_outcome(res)` call was missing entirely, meaning the
+dominance check could be fully correct internally while the RPC response
+carried no trace of it.
+
+**GTStore comparison, this branch specifically:** this defensive check
+exists only because `W<N` lets a write succeed without every replica
+having seen it, so a later coordinator can genuinely not know what some
+other coordinator already landed on the same replica set. GTStore's
+write-all model has no equivalent scenario for this check to catch —
+every successful write is already agreed by every replica before the
+client sees a response, so a replica can never legitimately turn out to
+be "more current than the coordinator." The cost GTStore pays instead:
+one down replica blocks every write to that key.
+
+**Verification:** `harness/test_replica_boundary.sh` — all sections
+pass, including the new dominance-check sequence.
+
+---
+
+### Branch 5 close-out — `phase4/get-read-path`
+Merged to `main`. `Get`'s arrival-order-argmin selection replaced with
+`resolveGetResult` over collected replica responses, filtered first.
+**Q20 fully resolved — moved to `OPEN_QUESTIONS.md`'s Resolved section.**
+
+**Design gap surfaced and resolved during this branch, not covered by
+decision D1's original text:** D1 assumed every responding replica holds
+a value; in practice some legitimately report `found=false` (a replica
+behind under sloppy quorum, `W<N`). Resolution: the `results.size() >= R_`
+quorum check runs on *all* responses, found or not — this is what
+preserves the `W+R>N` overlap guarantee (a replica that hasn't caught up
+yet must not be able to cause a false quorum failure). Only after quorum
+is confirmed does the handler filter to the found-only subset and run
+`resolveGetResult` on that. An empty found-subset despite meeting quorum
+is a legitimate `found=false`, logged as `GET_SUCCEEDED` (the read
+succeeded; it just confirmed the key isn't there) — distinct from not
+reaching quorum at all, which logs `GET_FAILED`.
+
+**A tempting-but-wrong shortcut, considered and rejected:** treating a
+`found=false` replica as an implicit empty-clock `VersionedValue` and
+feeding everything uniformly through `resolveGetResult`, rather than
+filtering first. Rejected because an empty vector clock isn't a reliable
+signal for "never written" — `storeReplicatedWrite`'s new-key branch
+(branch 4) stores whatever clock arrives unconditionally, including none,
+so a key written directly via `--replicate-write` with no `--clock` (as
+`test_replica_boundary.sh`'s own `foo` key is) legitimately has an empty
+clock while still existing. Unifying the two cases would have silently
+mistreated that key.
+
+`arrival_order` is removed entirely, not just unused — per Q20's
+resolution, it was never a real policy, just a side effect of local reads
+running synchronously before any remote RPC was dispatched. `results_mutex`
+is retained; it was never *only* protecting `arrival_order` bookkeeping —
+it's the only thing making concurrent `push_back` from the fan-out
+lambdas safe, independent of whatever the vector's contents are used for.
+
+**Bugs caught before landing, across several rounds against a real
+compiler:** a dangling `&next_arrival` lambda capture left over after
+`arrival_order` was removed; building the found-subset as
+`vector<ReplicaResult>` and pushing `VersionedValue`s into it (wrong
+declared type, not just a naming mismatch); a `resolved` variable read in
+a log line one line before its own declaration; a search-back loop
+matching a resolved `VersionedValue` against the original `ReplicaResult`
+set by equality to find which one "won" — unnecessary, since
+`resolveGetResult`'s return value already *is* the answer, and the loop
+introduced a real fall-off-the-end-of-a-non-void-function path if no
+match were ever found; a missing `return` on the success path; a
+not-found log line missing `key=`, breaking the grep convention every
+other line in the file follows.
+
+**Known gap, accepted for now:** with `arrival_order` gone, the order
+entries land in the results vector is whichever order fan-out threads
+happen to acquire `results_mutex` — nondeterministic across runs. Only
+matters for `resolveLWW`'s full-tie fallback (identical `last_updated`
+*and* identical `writer_id`, first-seen-wins) — Q24 already accepts that
+residual case as vanishingly narrow; "first-seen" now means
+"first-to-grab-the-lock" rather than anything meaningful, which is fine
+to accept but worth remembering if a flaky test ever hinges on it.
+
+**GTStore comparison, this branch specifically:** this is Phase 4's
+read-path bill for Phase 3's write-path choice arriving in full.
+GTStore's write-all model means every successful write is already agreed
+by every replica before a client ever sees a response, so its read path
+never has to ask "did I get one replica's opinion or the field's actual
+state" — there's only ever one state to report. `Get` doing
+frontier-comparison-then-LWW is the direct cost of having let Phase 3's
+writes succeed before full replication.
+
+**Verification:** none at merge time — no harness exercises `--get=` at
+all (old logic or new). Manually traced against the `W+R>N` overlap
+scenario and the four `ClockComparison` cases already covered by
+`test_vector_clocks.cpp`. **Tracked as a near-term gap, not closed** —
+the phase's core read-resolution path currently has zero automated
+coverage.
+
+---
+
+### Branch 6 close-out — `phase4/driftclient-context-roundtrip`
+Merged to `main`. `DriftClient` now holds a per-key `last_context_`
+cache (`unordered_map<string, VectorClock>`). `put()` attaches the
+cached clock on the outgoing request (a coordinator merges against it
+per decision A1 instead of treating the call as blind) and updates the
+cache from the response; `get()` updates it on `found=true`.
+`PutResult`/`GetResult` both gained a `context` field so callers can
+inspect the resolved clock directly, not just success/found.
+
+**Explicitly treated as client-side bookkeeping, not correctness-critical
+policy, per project owner's direction** — implemented directly rather
+than through the usual design-first-then-implement round used for
+Phase 4's other branches. One design call still worth recording: `Put`'s
+early-refusal paths (self-removed, forward-loop-prevented, preference
+list smaller than `W`) return before ever touching `PutResponse.context`,
+leaving it at proto3's empty default. Caching blindly from every
+response would let an unrelated refusal silently wipe out a real cached
+context. Guard: only cache when the response's clock actually has at
+least one counter (`resp.context().counters().size() > 0`) — a response
+that ran `coordinatePut`'s fan-out always has one (`buildNewClock`
+unconditionally increments the coordinator's own axis), including the
+`acks < W` quorum-miss case, which decision D3 already calls safe to
+cache from. `Get` doesn't need this guard — it only ever populates
+`context` on `found=true`, so `found` alone is a sufficient signal.
+
+CLI driver (`driftclient.cpp`) updated to exercise both halves: prints
+`context=...` after every `put()` call, and now also calls `get()` once
+at the end (nothing in this codebase called `DriftClient::get()` before
+this branch) and prints its `found`/`value`/`context`.
+
+**Verification:** manual, run by the project owner directly (not through
+a scripted harness) — a single-node sanity check (`--N=1 --W=1 --R=1`,
+three sequential `put()` calls to one key through one node, no
+rotation/replication to obscure the mechanism) showed the expected
+single-axis monotonic increment (`{addr}:1` → `{addr}:2` → `{addr}:3`);
+`harness/test_coordinator_rotation.sh` (3-node rotation/failover
+scenario) showed the expected two-axis growth matching the coordinator
+sequence. Both confirmed passing.
+
+**GTStore comparison, this branch specifically:** this entire
+mechanism — a client caching a causal token and replaying it on its next
+write — has no GTStore counterpart. A write-all client never needs to
+tell the server "here's what I last saw" for the server to detect a
+conflict, because there's nothing to detect: every prior write already
+touched every replica, so the client's view can't be behind in a way
+that matters. This is Dynamo's `context` object made concrete — the
+price of letting writes succeed before full replication instead of
+blocking for it.
+
+---
+
+### Branch 7 close-out — `phase4/observability-logging`
+Merged to `main`. Two new `EventType` values (`CONFLICT_RESOLVED`,
+`EQUAL_CLOCK_DETECTED`) in `logging.hpp`; `clock=` now appended to both
+`PUT_SUCCEEDED` and `GET_SUCCEEDED` via a new `renderClock()` helper in
+`node_kv.cpp` (anonymous namespace, sorted `{node:count,...}` output —
+same pattern `node.cpp`'s `dumpTable()` already established for
+diffable-by-eye log output).
+
+`resolveGetResult` (`vector_clock.hpp`) now returns a
+`GetResolution{winner, concurrent_count}` struct instead of a bare
+`VersionedValue`. Considered having `Get`'s handler call `computeFrontier`
+directly instead and inline the "frontier, then `resolveLWW` only if
+`size() > 1`" composition itself, to avoid touching the library's tested
+signature — rejected, because that would leave two places (this file and
+`Get`'s handler) independently knowing that composition rule, free to
+drift apart if it's ever revised. `CONFLICT_RESOLVED` fires in `Get` when
+`concurrent_count > 1`, logged with the count and the winner's clock.
+
+`EQUAL_CLOCK_DETECTED` fires only from `storeReplicatedWrite`'s own
+`EQUAL` branch — split out from `DOMINATES`, which shares the same
+`ALREADY_CURRENT` outcome but isn't a canary condition. Deliberately does
+**not** fire from `computeFrontier`'s dedup step, where two replicas
+independently reporting the same write during an ordinary `Get` is
+expected and frequent, not evidence of anything wrong. Given there is
+currently no retry path anywhere in `coordinatePut` or the gRPC
+transport, an incoming write's clock being `EQUAL` to what's already
+stored at a replica should be unreachable in normal operation — if it
+fires, the working theory is a B1 critical-section violation (two racing
+`Put`s at one coordinator reading the same stale base), not a harmless
+duplicate delivery.
+
+**Q23 cross-reference:** Q23 (resolved during Phase 3) decided
+`ReplicateWrite`/`ReplicateRead` shouldn't log routine success/failure,
+since `Put`/`Get`'s own lines already carry enough signal. This branch
+adds a `logEvent` call inside `storeReplicatedWrite` anyway, reached via
+`ReplicateWrite` — worth noting explicitly so Q23 doesn't read as
+contradicted: the exception is narrow and deliberate. `EQUAL_CLOCK_DETECTED`
+isn't routine success/failure reporting, it's an anomaly a coordinator's
+own log genuinely cannot see (it has no visibility into what a specific
+remote replica's dominance check decided) — Q23's reasoning doesn't cover
+this case either way.
+
+**Bugs caught before landing:** a missing `;` after the new
+`GetResolution` struct definition (would have cascaded into confusing
+errors on the next declaration, not a clean "missing semicolon"
+message); a leftover `resolved.value` reference on the `GET_SUCCEEDED`
+line from before the `VersionedValue` → `GetResolution` rename
+(`GetResolution` has no `.value` member — `.winner.value` is what's
+needed); a `GetResoltion` typo on first draft.
+
+**Known gap, carried forward, not addressed in this branch:**
+`coordinatePut`'s fan-out lambda still only reads `resp.success()` for
+ack-counting — `ReplicateWriteResponse.outcome`, populated on every path
+since branch 4, is never read anywhere. No per-replica STORED/
+ALREADY_CURRENT visibility on the coordinator side.
+
+**GTStore comparison, this branch specifically:** every piece of
+instrumentation added here exists purely because Driftstore's `Get` can
+see disagreeing replicas at all. GTStore's write-all model has no
+equivalent state to reconcile at read time — a `CONFLICT_RESOLVED` line
+is structurally impossible to write there, not just unlikely. This
+branch is the direct tooling tax on moving the consistency cost from
+write-time (GTStore: block until every replica acks) to read-time
+(Driftstore: resolve on the way out).
+
+**Verification:** `harness/test_conflict_observability.sh` — direct
+`--replicate-write` injection of two genuinely `CONCURRENT` clocks
+(deterministic, same technique `test_replica_boundary.sh` uses),
+confirms `CONFLICT_RESOLVED` fires and `EQUAL_CLOCK_DETECTED` fires
+exactly once total (only on a true duplicate delivery, not the
+genuine-concurrency case). *Written but not yet run against the built
+binaries — update this line with the actual pass/fail count before
+treating this branch as verified.*
+
+---
+
+### Branch 8 close-out — `phase4/conflict-scenario-harness`
+Merged to `main`. `harness/test_conflict_scenario_race.sh` — the real
+two-coordinator scenario, as opposed to branch 7's own verification
+harness, which used direct `--replicate-write` injection and never
+touched a coordinator.
+
+**Design finding, surfaced while scoping this branch, not assumed going
+in:** traced through what a *sequential* two-coordinator write actually
+does before writing this. If coordinator A's `Put` — full fan-out
+included — finishes before coordinator B's `Put` even starts,
+`storeReplicatedWrite`'s no-arbitration policy on `CONCURRENT` clocks
+means B's later, fully-sequential fan-out just overwrites every replica
+uniformly. No disagreement survives to be observed. Sequential
+two-coordinator puts **cannot** produce a conflict under the current
+design — genuine real-time RPC overlap is required, which is a real
+race, non-deterministic on localhost.
+
+**Accepted, deliberately, per project owner's direction, rather than
+solved:** the harness does not try to force the overlap. Instead: retry
+a *fresh* key (avoids carrying one attempt's leftover vector-clock state
+into the next attempt's `buildNewClock` merge) up to `MAX_ATTEMPTS` (20)
+times. What isn't accepted as flaky is the system's reaction whenever
+the race does land — every attempt, whether it diverged or not, checks a
+hard invariant: ground-truth replica disagreement (direct
+`--replicate-read` on all three nodes, bypassing `Get`'s own resolution
+entirely) must exactly match whether `CONFLICT_RESOLVED` was logged on
+the `Get`-coordinating node. A run where genuine divergence never occurs
+across all attempts is itself reported as a failure — a run that never
+triggers the scenario hasn't tested it, regardless of how many
+individual invariant checks trivially passed on the non-divergent
+attempts.
+
+**Known gap, not addressed in this branch:** can confirm a conflict
+resolves to one of the two legitimate values, not that it resolves to
+the *correct* one under LWW. `renderClock()` and `client.cpp`'s
+`clockToString()` both only render the counters map — `last_updated`
+and `writer_id` aren't exposed on any log line or CLI output anywhere in
+the codebase, so there's no ground truth available to check the winner
+against. Tracked as a new open question — see `OPEN_QUESTIONS.md`, Q26.
+
+**GTStore comparison, this branch specifically:** this harness tests a
+failure mode that's structurally impossible in GTStore, not just rare.
+GTStore's centralized manager means there's only ever one coordinator
+for a given write — "two coordinators race for the same key" isn't an
+available state there at all. Driftstore's leaderless design is what
+manufactures this scenario in the first place; the reconciliation
+machinery this whole phase built (vector clocks, `computeFrontier`,
+`resolveLWW`, and now this harness) is the tax on the availability gain
+of not having that single coordinating point.
+
+**Verification:** `harness/test_conflict_scenario_race.sh`. *Written
+but not yet run — update this line with the actual pass/fail count and
+the observed divergence rate (`N / 20`) before treating this branch as
+verified.*
 
 ---
 

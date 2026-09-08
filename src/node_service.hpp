@@ -104,14 +104,17 @@ public:
 
     std::vector<PreferenceListEntry> preferenceListForKey(const std::string& key, int N);
 
+    // This is to find a substitute during live RPC failure
+    std::optional<std::string> findSubstitute(const std::string& key, const std::string& true_owner, const std::unordered_set<std::string>& excluded);
+
     bool bootstrapFromSeed(const std::vector<std::string>& seeds);
 
 private:
     std::string node_id_;
     int vnodes_;
     driftstore::MembershipTable table_;
-    std::mutex table_mutex_;
     std::map<uint64_t, std::string> ring_;
+    std::mutex table_mutex_;
     std::unordered_set<std::string> unreachable_peers_;
     std::mutex unreachable_peers_mutex_;
     std::unordered_map<std::string, VersionedValue> kv_store_;

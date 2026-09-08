@@ -248,6 +248,24 @@ std::vector<PreferenceListEntry> NodeServiceImpl::preferenceListForKey(const std
     return preferenceList(ring_, mix64(fnv1a64(key)), N, predicate);
 }
 
+std::optional<std::string> NodeServiceImpl::findSubstitute(const std::string& key,
+                                          const std::string& true_owner, // the original intended owner ('hint_for'...)
+                                          const std::unordered_set<std::string>& excluded) {
+    std::unordered_set<std::string> unreachable_peers = unreachableSnapshot();
+    // identify nodes that are REACHABLE and HAVE NOT YET been added to the current preference list
+    auto predicate = [unreachable_peers, excluded, true_owner](const std::string& candidate) {
+        return unreachable_peers.find(candidate) == unreachable_peers.end() &&
+                excluded.find(candidate) == excluded.end() &&
+                candidate != true_owner;
+    };
+    std::lock_guard<std::mutex> lock(table_mutex_);
+    std::vector<PreferenceListEntry> result = preferenceList(ring_, mix64(fnv1a64(key)), 1, predicate);
+    if (result.empty()) {
+        return std::nullopt;
+    }
+    return result[0].node_id;
+}
+
 grpc::Status NodeServiceImpl::forwardPut(const driftstore::PutRequest* request,
                                          const std::vector<PreferenceListEntry>& pref_list,
                                          driftstore::PutResponse* response) {
@@ -299,12 +317,26 @@ grpc::Status NodeServiceImpl::coordinatePut(const std::string& key,
         return grpc::Status::OK;
     }
 
+    std::unordered_set<std::string> pref_list_ids; // This will be used in the event that a substitute is needed (will SKIP over ALL current preference nodes)
+    for (const auto& e : pref_list) pref_list_ids.insert(e.node_id);
     std::atomic<int64_t> acks{0}; // IMPORTANT to make it atomic as two threads can read same value, increment ==> LOSE an ack
 
     driftstore::VectorClock clock;
     for (const auto& entry : pref_list) {
         if (entry.node_id == node_id_) {
-            clock = commitCoordinatedWrite(key, value, client_context);
+            if (!entry.hint_for_node_id.has_value()) {
+                clock = commitCoordinatedWrite(key, value, client_context);
+            } else {
+                clock = buildNewClock(client_context, std::nullopt, entry.node_id);
+                HeldHint hint{key, value, clock, nowMillis()};
+                {
+                    std::lock_guard<std::mutex> lock(hints_mutex_);
+                    hints_for_target_[*entry.hint_for_node_id].push_back(std::move(hint));
+                }
+                logEvent(EventType::HINT_STORED, node_id_, "key=" + key + " original_owner=" + *entry.hint_for_node_id +
+                            " stored_on=" + node_id_ +
+                            " source=local_coordinator");
+            }
             acks++;
             break;
         }
@@ -316,25 +348,47 @@ grpc::Status NodeServiceImpl::coordinatePut(const std::string& key,
             continue;
         }
         futures.push_back(std::async(std::launch::async,
-            [this, peer_id = entry.node_id, key, value, clock, &acks]() {
-                auto channel = grpc::CreateChannel(peer_id, grpc::InsecureChannelCredentials());
-                std::unique_ptr<driftstore::DriftStoreNode::Stub> stub =
-                    driftstore::DriftStoreNode::NewStub(channel);
-    
-                driftstore::ReplicateWriteRequest req;
-                req.set_key(key);
-                req.set_value(value);
-                *req.mutable_vector_clock() = clock;
-                driftstore::ReplicateWriteResponse resp;
-                grpc::ClientContext context;
-                grpc::Status status = stub->ReplicateWrite(&context, req, &resp);
-                
-                if (status.ok()) {
-                    if (resp.success()) {
-                        acks++;
+            [this, entry, key, value, clock, &acks, pref_list_ids]() {
+                std::string target = entry.node_id;
+                std::string true_owner = entry.hint_for_node_id.value_or(entry.node_id);
+                std::unordered_set<std::string> excluded = pref_list_ids;
+                bool is_hint = entry.hint_for_node_id.has_value();
+                while (true) {
+                    auto channel = grpc::CreateChannel(target, grpc::InsecureChannelCredentials());
+                    std::unique_ptr<driftstore::DriftStoreNode::Stub> stub =
+                        driftstore::DriftStoreNode::NewStub(channel);
+        
+                    driftstore::ReplicateWriteRequest req;
+                    req.set_key(key);
+                    req.set_value(value);
+                    *req.mutable_vector_clock() = clock;
+                    if (is_hint) {
+                        req.set_hint_for_node_id(true_owner);
                     }
-                } else {
-                    markUnreachable(peer_id);
+                    driftstore::ReplicateWriteResponse resp;
+                    grpc::ClientContext context;
+                    grpc::Status status = stub->ReplicateWrite(&context, req, &resp);
+                    
+                    if (status.ok()) {
+                        if (resp.success()) {
+                            acks++;
+                            if (is_hint) {
+                                logEvent(EventType::HINT_CREATED, node_id_, "key=" + key + " hint_for=" + true_owner + " stored_on=" + target);
+                            }
+                            return;
+                        }
+                    } else {
+                        markUnreachable(target);
+                    }
+                    excluded.insert(target);
+                    // Try and find a substitute because now the write has FAILED (but not a live RPC failure)
+                    std::optional<std::string> substitute = findSubstitute(key, true_owner, excluded);
+                    if (!substitute) {
+                        logEvent(EventType::HINT_SEARCH_EXHAUSTED, node_id_, "key=" + key + " original_target=" + true_owner);
+                        return;
+                    }
+                    target = *substitute;
+                    is_hint = true;
                 }
             }));
     }

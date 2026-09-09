@@ -120,7 +120,7 @@ private:
     std::unordered_map<std::string, VersionedValue> kv_store_;
     std::mutex kv_store_mutex_;
     // Hints container is keyed by node_id to answer "which hints are held for Node X" when Node X responds again
-    std::unordered_map<std::string, std::vector<HeldHint>> hints_for_target_;
+    std::unordered_map<std::string, std::unordered_map<std::string, HeldHint>> hints_for_target_;
     std::mutex hints_mutex_;
     
     int64_t N_;
@@ -171,6 +171,8 @@ private:
     void gossipRound();
 
     void reachabilityRound();
+
+    void deliverHints(const std::string& target_node_id);
 
     /**
     * Selects a peer to gossip with. If none, log + return.

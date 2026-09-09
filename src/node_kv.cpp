@@ -50,11 +50,29 @@ grpc::Status NodeServiceImpl::ReplicateWrite(grpc::ServerContext* /*context*/,
         hint.value = request->value();
         hint.clock = request->vector_clock();
         hint.created_at = nowMillis();
+        std::string key = hint.key;
         {
-            std::lock_guard<std::mutex> lock(hints_mutex_);
-            hints_for_target_[request->hint_for_node_id()].push_back(std::move(hint));
+            {
+                markUnreachable(request->hint_for_node_id());
+                std::lock_guard<std::mutex> lock(hints_mutex_);
+                auto it = hints_for_target_.find(request->hint_for_node_id());
+                if (it != hints_for_target_.end()) {
+                    auto it2 = it->second.find(key);
+                    if (it2 != it->second.end()) {
+                        driftstore::VectorClock curr_clk = it2->second.clock;
+                        ClockComparison comp_res = compareVectorClocks(curr_clk, hint.clock);
+                        if (comp_res == ClockComparison::DOMINATED || comp_res == ClockComparison::CONCURRENT) {
+                            hints_for_target_[request->hint_for_node_id()][key] = std::move(hint);
+                        } // else (EQUAL or DOMINATES --> take local copy)
+                    } else { // key not found
+                        hints_for_target_[request->hint_for_node_id()][key] = std::move(hint);
+                    }
+                } else { // if the target node is not yet in the hints target map
+                    hints_for_target_[request->hint_for_node_id()][key] = std::move(hint);
+                }
+            }
         }
-        logEvent(EventType::HINT_STORED, node_id_, "key=" + hint.key + " for=" + request->hint_for_node_id());
+        logEvent(EventType::HINT_STORED, node_id_, "key=" + key + " for=" + request->hint_for_node_id());
         response->set_success(true);
         response->set_outcome(driftstore::WriteOutcome::STORED);
         return grpc::Status::OK;
@@ -331,7 +349,22 @@ grpc::Status NodeServiceImpl::coordinatePut(const std::string& key,
                 HeldHint hint{key, value, clock, nowMillis()};
                 {
                     std::lock_guard<std::mutex> lock(hints_mutex_);
-                    hints_for_target_[*entry.hint_for_node_id].push_back(std::move(hint));
+                    auto it = hints_for_target_.find(*entry.hint_for_node_id);
+                    if (it != hints_for_target_.end()) {
+                        auto it2 = it->second.find(key);
+                        if (it2 != it->second.end()) {
+                            driftstore::VectorClock curr_clk = it2->second.clock;
+                            ClockComparison comp_res = compareVectorClocks(curr_clk, clock);
+                            if (comp_res == ClockComparison::DOMINATED) {
+                                hints_for_target_[*entry.hint_for_node_id][key] = std::move(hint);
+                            } // else if comp_res == ClockComparison::CONCURRENT (perform LWW-esque alg)
+                                // else (EQUAL or DOMINATES --> take local copy)
+                        } else { // key not found
+                            hints_for_target_[*entry.hint_for_node_id][key] = std::move(hint);
+                        }
+                    } else { // if the target node is not yet in the hints target map
+                        hints_for_target_[*entry.hint_for_node_id][key] = std::move(hint);
+                    }
                 }
                 logEvent(EventType::HINT_STORED, node_id_, "key=" + key + " original_owner=" + *entry.hint_for_node_id +
                             " stored_on=" + node_id_ +

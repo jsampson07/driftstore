@@ -40,6 +40,7 @@ enum class EventType {
     HINT_SEARCH_EXHAUSTED,
     HINT_STORED,
     HINT_STORE_FAILED,
+    HINT_DELIVERED,
 };
 
 inline const char* toString(EventType e) {
@@ -79,6 +80,7 @@ inline const char* toString(EventType e) {
         case EventType::HINT_SEARCH_EXHAUSTED: return "HINT_SEARCH_EXHAUSTED";
         case EventType::HINT_STORED: return "HINT_STORED";
         case EventType::HINT_STORE_FAILED: return "HINT_STORE_FAILED";
+        case EventType::HINT_DELIVERED: return "HINT_DELIVERED";
     }
 }
 

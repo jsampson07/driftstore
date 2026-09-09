@@ -72,6 +72,20 @@ resolving this question before Phase 8's kill/restart fault injection
 deliberately creates the exact conditions that produced it here by
 accident.
 
+**Update, Phase 5 `feature/hh-delivery` session:** the "existing
+hinted-handoff obligations addressed to it" scenario this question already
+named — written before hinted handoff existed — is now concretely
+implemented, not hypothetical. `hints_for_target_` is keyed by `node_id`
+(== address, per this question's own subject). If a node ever needed to
+restart on a different address while keeping its identity — the exact
+divergence this question asks about — every hint held for its old key
+would become permanently unreachable: nothing re-keys `hints_for_target_`
+on an address change, and `deliverHints` dials `target_node_id` directly
+as a network address. Doesn't change this question's resolution, but
+Phase 5 is now a second concrete, already-shipped feature (alongside
+token placement, named in the original text) whose correctness quietly
+depends on this invariant holding.
+
 ### Q9 — No error handling on `--gossip-interval`'s parse in `main()`
 `std::stoll(gossip_interval_ms)` throws on malformed input (e.g.
 `--gossip-interval=abc`), and nothing catches it — unlike the
@@ -190,6 +204,21 @@ it's still new surface on `GetStatus`, not something to add reflexively
 just because it's easy.
 
 *Context:* raised during the probe thread design/implementation session.
+
+**Update, Phase 5 `feature/hh-delivery` session:** this gap directly
+limited what `test_hinted_handoff.sh` could assert. Two different code
+paths create a hint — a live RPC failure discovered mid-write, versus the
+coordinator already knowing the target is down before it even computes
+the preference list (see `PROGRESS.md`'s Phase 5 section) — and
+distinguishing which one fired for a given key would have been
+straightforward if a node's current `unreachable_peers_` set were
+queryable, but isn't recoverable from log correlation alone
+(`coordinatePut`'s fan-out doesn't log a distinct event for a live RPC
+failure, only for the resulting hint). The test's own header comment
+documents this as an accepted limitation rather than something it
+verifies — a second concrete instance (Q26, from Phase 4, is the first)
+of this project's log-only observability falling short of what a specific
+test actually wanted to check.
 
 ### Q19 — Should N/W/R be enforced system-wide, or admin-declared per-node by convention only?
 Surfaced while starting `Put`/`Get`'s design: `N`/`W`/`R` are node-level CLI
@@ -389,6 +418,92 @@ harness that uses real (non-injected) concurrent writes.
 *Context:* raised during `phase4/conflict-scenario-harness` (branch 8),
 while scoping what `test_conflict_scenario_race.sh` could and couldn't
 verify.
+
+### Q28 — No TTL/expiry on held hints
+`HeldHint` carries a `created_at` timestamp that nothing currently reads.
+Combined with Q27's decision (below, Resolved) not to purge hints when
+their target is marked `REMOVED`, a hint for a target that never actually
+comes back — `REMOVED` and gone for good, or simply never rejoining — sits
+in `hints_for_target_` forever, an unbounded and currently unmonitored
+memory-growth path on any long-running node with real churn.
+
+*Status:* unresolved, explicitly deferred ("later, not never") — needed
+once "presumed dead, never coming back, never explicitly removed" becomes
+a real scenario this project actually exercises (plausibly Phase 8's
+fault injection), not before.
+*Context:* raised during `feature/hh-delivery` design discussion,
+alongside Q27.
+
+### Q29 — Should `deliverHints` fire async per-peer instead of blocking `reachabilityRound`?
+Two nested blocking behaviors in the current shape: `deliverHints` blocks
+on all of one peer's hint-delivery RPCs (`for (auto& f : futures) f.get();`)
+before returning, and `reachabilityRound`'s outer loop calls
+`markReachable` + `deliverHints` sequentially, peer by peer. A peer
+recovering with a large hint backlog currently delays not just its own
+reachability bookkeeping but every other recovering peer in the same
+round.
+
+*Status:* unresolved, explicitly deferred — agreed to be worth fixing
+eventually, matching the async fan-out pattern `reachabilityRound`
+already uses for the probe calls themselves (`pingPeer` via
+`std::async`), but not blocking this phase.
+*Context:* raised during `feature/hh-delivery` implementation review.
+
+### Q30 — Lock-order invariant between `hints_mutex_` and `unreachable_peers_mutex_` is implicit, not enforced
+Hint-storage sites call `markUnreachable` (locks `unreachable_peers_mutex_`)
+while already holding `hints_mutex_`. Safe today only because nothing in
+the codebase currently acquires the two mutexes in the reverse order — a
+real invariant, but an entirely unenforced one. Nothing (a comment, an
+assertion, a documented convention) currently stops a future change from
+introducing the reverse order and creating a deadlock that would be
+substantially harder to find than the ones already caught during this
+phase's own review.
+
+*Status:* unresolved, low stakes today — worth a one-line comment at both
+mutex declarations in `node_service.hpp` before it's forgotten; not
+urgent beyond that.
+*Context:* raised during `feature/hh-delivery` code review.
+
+### Q31 — The `CONCURRENT`-clock hint-overwrite policy has never actually been exercised
+Both hint-storage sites treat an incoming hint whose clock is `CONCURRENT`
+with an already-held hint the same as `DOMINATED` — overwrite — for
+consistency with `storeReplicatedWrite`'s existing policy on the identical
+clock relationship (Phase 4). `test_hinted_handoff.sh` uses a single
+sequential client, so two genuinely concurrent hint writes to the same
+`(target, key)` never actually happen in that test — the branch is
+reachable by design, untested in practice.
+
+*Status:* unresolved — the policy is a considered decision, not a guess,
+but "considered and untested" isn't the same as "verified." Needs a
+scenario that actually manufactures two overlapping coordinators writing
+to the same key while the same third node is down — the same real-RPC-
+overlap problem `test_conflict_scenario_race.sh` (Phase 4) already had to
+solve for the non-hint case; likely the same retry-until-it-lands
+technique applies here.
+*Context:* raised during `feature/hh-delivery` close-out, cross-
+referencing the Phase 4 branch 8 precedent for testing genuine races.
+
+### Q32 — Was `test_hinted_handoff.sh`'s initial convergence timeout actually root-caused, or just no longer observed?
+Same shape as Q10. The first run of `test_hinted_handoff.sh` failed
+`wait_for "A" "table_size=4"` after the full 20s timeout, despite
+`node_a.log` showing healthy, frequent 4-way gossip convergence within
+milliseconds of startup — a mismatch pointing at the `--status` RPC
+itself failing, not a genuine convergence delay. The leading suspect
+in-session was a stale process from an earlier run silently squatting on
+a port (the exact Q11 failure mode — `pkill -f "$NODE_BIN"`'s exact-string
+match can miss a process started a different way). Separately,
+`status_dump`'s helper was found to redirect the client's stderr to
+`/dev/null`, which would hide the actual RPC error regardless of cause —
+that was fixed. The next run passed. Which of the two candidate causes —
+a stale process that happened to be gone by the next run, or the stderr
+fix actually surfacing/resolving something real — actually explains the
+fix was never conclusively isolated.
+
+*Status:* unresolved — worth deliberately reproducing (leave a stale
+process running on purpose, rerun with the fixed script) before trusting
+that this specific failure mode won't recur silently.
+*Context:* raised during `feature/hh-delivery` test-harness debugging
+session.
 
 ---
 
@@ -839,3 +954,25 @@ originally raised, not a new one.
 *Context:* raised while reviewing the `Get` coordinator handler, Phase 3
 implementation session; sharpened during the Phase 3 checkpoint session;
 resolved during `phase4/get-read-path` (branch 5/9) implementation.
+
+### Q27 — Should held hints be purged when their target is marked `REMOVED`?
+Raised while designing hint delivery: `deliverHints` only ever fires from
+the reachability-probe recovery path, never on a `REMOVED` transition. A
+held hint's target can be marked `REMOVED` — directly via `RemoveNode`, or
+secondhand through `mergeInto`'s `UP→REMOVED` gossip branch — with nothing
+telling whoever is holding hints for it to stop, or to give up on them.
+
+**Resolution: do not purge.** Consistent with `ring.hpp`'s own
+`REMOVED→UP` handling (the `NODE_REBOOTED` branch inside `mergeInto`)
+already treating `REMOVED` as "administratively marked down," not "gone
+forever" — a node can rejoin under the same identity after being
+`REMOVED`, and if it does, any hints still held for it should still be
+deliverable. Explicit project-owner decision, not one derived automatically
+from the `REMOVED→UP` precedent alone — that precedent was raised as
+*consistent with* the choice, not as the reason for it. Accepted tradeoff:
+hints for a target that is `REMOVED` and never actually comes back
+accumulate indefinitely, with nothing currently bounding that growth (see
+Q28).
+
+*Context:* raised during `feature/hh-delivery` design discussion.
+*Resolved during:* same session.

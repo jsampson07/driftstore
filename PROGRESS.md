@@ -14,7 +14,7 @@
 | 2 | Consistent hashing ring + virtual nodes | ✅ Done |
 | 3 | Any-node coordinator + basic quorum read/write | ✅ Done |
 | 4 | Vector clocks + conflict detection | ✅ Done |
-| 5 | Hinted handoff | ⬜ Not started |
+| 5 | Hinted handoff | ✅ Done |
 | 6 | Read-repair | ⬜ Not started |
 | 7 | Dashboard | ⬜ Not started |
 | 8 | Fault-injection harness (minimum viable) | ⬜ Not started |
@@ -2691,6 +2691,206 @@ the observed divergence rate (`N / 20`) before treating this branch as
 verified.*
 
 ---
+
+## Phase 5 — Hinted handoff (Done)
+
+Two branches: `feature/hh-discovery` (hint creation and storage) and
+`feature/hh-delivery` (hint delivery). `hh-discovery` landed before this
+project's Claude conversation history picked it up mid-stream, so its
+section below is written retroactively from reviewing the merged code, not
+from a design session transcript the way Phase 4's sections were.
+`hh-delivery` was designed, debugged, and tested end-to-end in conversation
+— the write-up below reflects that process, including the bugs caught
+along the way, not just the final shape.
+
+### `feature/hh-discovery` — hint creation and storage
+
+**Ring walk extension (`ring.hpp`'s `preferenceList`).** Closes the gap
+Phase 3 deliberately left open (see that phase's section above: "adding it
+now would be building half a mechanism with nothing to attach the other
+half to"). The walk now counts a natural owner toward `N` whether or not
+it's reachable — an unreachable natural owner still consumes a slot rather
+than letting the list grow past `N` — and unreachable natural owners are
+queued (`std::queue<std::string> pending_hints`, FIFO) rather than dropped.
+The walk continues past the first `N` distinct physical nodes specifically
+to match queued skips to downstream reachable substitutes, in ring order.
+`PreferenceListEntry` gained `hint_for_node_id` (`std::optional<std::string>`,
+`nullopt` for a natural owner, the skipped node's id for a substitute) to
+carry this distinction back to the caller.
+
+**Two independent code paths produce a hint, not one.** (1) The ring walk
+above, when the coordinator's own `unreachable_peers_` already contains a
+natural owner *before* the preference list is even computed —
+`findSubstitute`'s call site never runs in this case; the substitute is
+already baked into the list. (2) `coordinatePut`'s fan-out retry loop,
+when a live `ReplicateWrite` RPC to a preference-list target fails (or the
+target responds but refuses the write, e.g. because it's since learned
+it's `REMOVED`) — the loop calls `findSubstitute(key, true_owner, excluded)`
+(same ring-walk function, `N=1`, a predicate excluding the true owner and
+everything already tried) and retries against whatever it returns, marking
+`is_hint = true` for that attempt. Both paths converge on the same
+`ReplicateWrite` payload shape (`hint_for_node_id` set) and the same
+`HINT_CREATED`/`HINT_STORED` logging — deliberately not distinguished at
+the log level (see Q18's Phase 5 update in `OPEN_QUESTIONS.md` for the
+concrete cost of that).
+
+**Storage sites, as merged:** `ReplicateWrite`'s hint branch (a hint
+arriving via RPC, stored on behalf of another node's coordinated write)
+and `coordinatePut`'s self-hint branch (the coordinator itself lands on a
+hint-holder slot for the key it's writing). Both appended into
+`hints_for_target_`, at that point still `unordered_map<node_id,
+vector<HeldHint>>` — no dedup, no dominance check; `hh-delivery` below
+replaced this structure.
+
+### `feature/hh-delivery` — hint delivery
+
+Reviewed in detail before any delivery code existed, since `hints_for_
+target_` was write-only at that point — nothing anywhere read it back.
+Confirmed by grepping the whole tree: no file outside `node_kv.cpp`
+referenced `hints_for_target_` or `HeldHint` at all.
+
+**Bugs caught during review and iteration, before/while this landed —
+listed because several of these are exactly the kind of thing this
+project's "I design correctness-critical logic myself, Claude reviews"
+workflow exists to catch, and are worth having a record of:**
+- A double-lock deadlock: the "target not yet in the hints map" branch,
+  in both storage sites, took a second `std::lock_guard` on the already-
+  held `hints_mutex_`. `std::mutex` isn't recursive — this would have
+  hung on literally the first hint ever stored for any given target, not
+  a rare interleaving.
+- A use-after-move read: `ReplicateWrite`'s log line read `hint.key`
+  *after* `std::move(hint)` had already been used to insert into the map,
+  on exactly the paths where a move actually happened. `std::string`'s
+  moved-from state is unspecified, not guaranteed empty.
+- `HINT_SEARCH_EXHAUSTED`'s log line was missing a `=` (`"key" + key`
+  instead of `"key=" + key`) — malformed structured-log output on the one
+  event that fires when hinted handoff has completely failed for a write,
+  the exact case worth being able to grep for cleanly.
+- An inverted early-return in `deliverHints`'s first draft (`if (it !=
+  hints_for_target_.end()) return;` — backwards; returns early exactly
+  when there *is* work to do, dereferences an end iterator otherwise).
+- Failure classification collapsed in two different places (once in
+  `markReachable`'s hint-delivery draft, again in `deliverHints` itself):
+  treating `!status.ok()` (genuine RPC/transport failure — fair to
+  `markUnreachable`) the same as `status.ok() && !response.success()`
+  (the peer answered and refused the write, e.g. it's `REMOVED` — not
+  unreachable at all). `coordinatePut`'s own retry loop already drew this
+  distinction correctly; the delivery-side code initially didn't.
+
+**Decision: `hints_for_target_` restructured to a per-key map.**
+`unordered_map<node_id, unordered_map<key, HeldHint>>`, not `unordered_map
+<node_id, vector<HeldHint>>`. O(1) erase-by-key on confirmed delivery
+instead of erase-remove on a vector scan, and natural per-key dedup
+instead of accumulating every write to the same key as a separate queued
+entry. This was done as a scoped, Cursor-executable mechanical refactor —
+declarations and call sites only, explicitly instructed not to add
+dominance/erase logic in the same pass — kept separate from the dominance
+check below specifically so the type change could be verified as
+zero-behavior-change in isolation.
+
+**Decision: dominance-checked overwrite on both storage sites, `CONCURRENT`
+treated the same as `DOMINATED`.** An incoming hint only replaces an
+already-held one if `compareVectorClocks` returns `DOMINATED` (incoming is
+newer) or `CONCURRENT` — not `EQUAL`/`DOMINATES`. Chosen for consistency
+with `storeReplicatedWrite`'s existing policy on the identical clock
+relationship (Phase 4): this system doesn't keep sibling versions, it
+overwrites on genuine conflict and reconciles at read time, so a hint
+silently keeping whichever of two conflicting writes arrived first —
+which is what the code did before this fix — was inconsistent with the
+policy already established elsewhere in the same file, not a considered
+alternative. See Q31 (`OPEN_QUESTIONS.md`) — this specific branch is not
+exercised by any current test.
+
+**Decision: `ReplicateWrite`'s hint branch now calls `markUnreachable` on
+the true owner when storing a hint.** This closes a gap that would have
+made delivery silently impossible in a real, non-rare case: `deliverHints`
+only ever runs from `reachabilityRound`, which only probes peers already
+present in a node's own `unreachable_peers_`. A node that receives a hint
+purely via RPC (path (2) above, where a *different* node computed the
+preference list and discovered the outage) had no independent reason to
+ever add the true owner to its own `unreachable_peers_` — so its own
+`reachabilityRound` would never probe that owner, `markReachable` would
+never fire for it, and the held hint would sit undelivered forever, even
+if the owner had been back online the whole time. The self-hint path
+(`coordinatePut`) doesn't need the same fix — by construction, the
+coordinator's own `unreachable_peers_` already contains the true owner,
+since that's the only way the ring walk would have skipped it in the
+first place.
+
+**`deliverHints(target_node_id)`, called from `reachabilityRound` right
+after `markReachable`.** Snapshots held hints for the recovered peer under
+`hints_mutex_`, releases the lock, then fans out one `ReplicateWrite` per
+held hint (deadline set, matching `pingPeer`'s existing pattern). On
+confirmed delivery (`status.ok() && response.success()`), erases the held
+hint — but only if the live entry for that key is still clock-`EQUAL` to
+what was actually delivered, guarding against a newer hint having landed
+for the same `(target, key)` between the snapshot and this callback
+completing. On failure, re-`markUnreachable`s only for a genuine transport
+failure (not a refused write), and logs `HINT_STORE_FAILED` with which
+kind of failure it was. New `HINT_DELIVERED` event added to
+`logging.hpp`, kept distinct from `HINT_STORED` — which already meant "I
+received and I'm holding this on someone else's behalf," the opposite
+direction from "I successfully handed this off."
+
+**Decision: hints are not purged when their target is marked `REMOVED`.**
+See Q27 (`OPEN_QUESTIONS.md`, Resolved) for the full reasoning — consistent
+with `ring.hpp`'s own `REMOVED→UP` reboot handling already treating
+`REMOVED` as administratively-down, not gone forever.
+
+**Deliberately deferred, tracked rather than silently dropped:** hint TTL
+(Q28), `deliverHints` firing async per-peer instead of blocking
+`reachabilityRound` peer-by-peer (Q29), a documented lock-ordering
+convention between `hints_mutex_` and `unreachable_peers_mutex_` (Q30), and
+whether a successful write RPC to a peer currently in `unreachable_peers_`
+should trigger early recovery instead of waiting on the next probe.
+
+**Known gap, not covered by `test_hinted_handoff.sh`:** the `CONCURRENT`
+overwrite branch above has never actually executed under test — the
+harness uses a single sequential client, so two genuinely concurrent hint
+writes to the same `(target, key)` never occur. Tracked as Q31.
+
+**Verification:** `harness/test_hinted_handoff.sh`. 4 nodes (not 3 — hinted
+handoff needs a node outside the natural `N` to hand a hint to, so the
+"`N` equals total node count" determinism trick prior scripts use doesn't
+apply here). Empirically searches candidate keys against a live cluster
+to find one whose natural owners include the killed node, rather than
+replicating the consistent-hash placement in bash — the same
+trial-against-the-real-ring approach `vnode_experiment.cpp` already uses
+elsewhere in this project. Confirms: the write stays available
+cluster-wide during the outage; hint creation via log correlation across
+all four nodes' logs (not just the coordinator's, since the actual
+coordinator for a given key isn't always the node the client happened to
+target); delivery via both the `HINT_DELIVERED` log line and — the actual
+proof, not just a trusted flag — a direct `--replicate-read` against the
+recovered node. First run failed `wait_for`'s initial 4-node convergence
+check in a way that turned out to be a script bug, not a system bug
+(`status_dump` was silently discarding the client's stderr, hiding what
+would have been a self-diagnosing error message) — see Q32, which mirrors
+Q10's shape exactly: the fix and the next passing run happened together,
+but which specific thing actually explained the original failure was
+never conclusively isolated.
+
+**GTStore comparison, this phase specifically:** take one of a key's `N`
+assigned replicas going down for some bounded window, then recovering.
+GTStore's write-all, manager-assigned model has no available middle state
+for this — either the manager reassigns ownership (which needs the
+manager to reach agreement with itself about current membership, the
+exact centralized-coordination shape this project set out not to have),
+or the write-all quorum for that key simply cannot be satisfied for the
+whole window and every write to it fails outright. There's no notion of
+"accept it somewhere else provisionally, reconcile once the real owner is
+back," because write-all has no concept of a value allowed to be
+provisionally divergent from the replica set's full agreement. Driftstore
+pays for the alternative concretely, not abstractly: a write coordinated
+while a natural owner is down and the coordinator itself lands on a
+hint-holder slot is causally uninformed by *any* of the key's real
+replicas (see the `CONCURRENT`-handling decision above, and the
+coordinator-as-hint-holder clock-provenance discussion earlier in this
+phase's design conversation) — a real, named cost, not a hidden one. What
+it buys in exchange: the write succeeds at all during the window, and the
+moment the real owner is confirmed reachable again, `deliverHints` closes
+the gap without waiting for a client `Get` to trigger read-repair
+(Phase 6) or for full anti-entropy to eventually notice.
 
 ## How to update this file
 When a phase wraps: flip its status in the table, add a summary block (what

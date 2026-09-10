@@ -41,6 +41,9 @@ enum class EventType {
     HINT_STORED,
     HINT_STORE_FAILED,
     HINT_DELIVERED,
+    READ_REPAIR_INIT,
+    READ_REPAIR_SUCCEEDED,
+    READ_REPAIR_FAILED,
 };
 
 inline const char* toString(EventType e) {
@@ -81,6 +84,9 @@ inline const char* toString(EventType e) {
         case EventType::HINT_STORED: return "HINT_STORED";
         case EventType::HINT_STORE_FAILED: return "HINT_STORE_FAILED";
         case EventType::HINT_DELIVERED: return "HINT_DELIVERED";
+        case EventType::READ_REPAIR_INIT: return "READ_REPAIR_INIT";
+        case EventType::READ_REPAIR_SUCCEEDED: return "READ_REPAIR_SUCCEEDED";
+        case EventType::READ_REPAIR_FAILED: return "READ_REPAIR_FAILED";
     }
 }
 

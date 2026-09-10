@@ -11,6 +11,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 #include <random>
 
@@ -250,11 +251,74 @@ grpc::Status NodeServiceImpl::Get(grpc::ServerContext* /*context*/,
                 " winner_writer_id=" + resolved.winner.clock.writer_id() +
                 " winner_last_updated=" + std::to_string(resolved.winner.clock.last_updated()));
     }
+
+    bool self_needs_repair = false;
+    std::vector<std::string> stale_peers;
+    for (const auto& r : results) {
+        bool stale = !r.found ||
+            compareVectorClocks(r.clock, resolved.winner.clock) != ClockComparison::EQUAL;
+        if (!stale) continue;
+        if (r.peer_id == node_id_) self_needs_repair = true;
+        else stale_peers.push_back(r.peer_id);
+    }
+
+    if (self_needs_repair || !stale_peers.empty()) {
+        logEvent(EventType::READ_REPAIR_INIT, node_id_,
+            "key=" + key + " stale_count=" + std::to_string(self_needs_repair + stale_peers.size()));
+    }
+
+    if (self_needs_repair) {
+        storeReplicatedWrite(key, resolved.winner);
+    }
+
+    if (!stale_peers.empty()) {
+        std::thread(&NodeServiceImpl::repairReplicas, this, key, resolved.winner,
+                    stale_peers).detach();
+    }
+
     response->set_found(true);
     response->set_value(resolved.winner.value);
     *response->mutable_context() = resolved.winner.clock;
     logEvent(EventType::GET_SUCCEEDED, node_id_, "key=" + key + " val=" + resolved.winner.value + " winning_clock=" + renderClock(resolved.winner.clock));
     return grpc::Status::OK;
+}
+
+void NodeServiceImpl::repairReplicas(const std::string& key,
+                                     const VersionedValue& winner,
+                                     std::vector<std::string> stale_peers) {
+    std::vector<std::future<void>> futures;
+    for (const auto& peer : stale_peers) {
+        futures.push_back(std::async(std::launch::async,
+            [this, peer, key, winner]() {
+                auto channel = grpc::CreateChannel(peer, grpc::InsecureChannelCredentials());
+                std::unique_ptr<driftstore::DriftStoreNode::Stub> stub =
+                    driftstore::DriftStoreNode::NewStub(channel);
+
+                driftstore::ReplicateWriteRequest req;
+                req.set_key(key);
+                req.set_value(winner.value);
+                *req.mutable_vector_clock() = winner.clock;
+
+                driftstore::ReplicateWriteResponse resp;
+                grpc::ClientContext context;
+                grpc::Status status = stub->ReplicateWrite(&context, req, &resp);
+
+                if (!status.ok()) {
+                    logEvent(EventType::READ_REPAIR_FAILED, node_id_,
+                        "key=" + key + " peer=" + peer + " reason=transport");
+                    markUnreachable(peer);
+                } else if (!resp.success()) {
+                    logEvent(EventType::READ_REPAIR_FAILED, node_id_,
+                        "key=" + key + " peer=" + peer + " reason=refused");
+                } else {
+                    const char* outcome = (resp.outcome() == driftstore::WriteOutcome::STORED)
+                        ? "STORED" : "ALREADY_CURRENT";
+                    logEvent(EventType::READ_REPAIR_SUCCEEDED, node_id_,
+                        "key=" + key + " peer=" + peer + " outcome=" + outcome);
+                }
+            }));
+    }
+    for (auto& f : futures) f.get();
 }
 
 std::vector<PreferenceListEntry> NodeServiceImpl::preferenceListForKey(const std::string& key, int N) {

@@ -174,6 +174,10 @@ private:
 
     void deliverHints(const std::string& target_node_id);
 
+    void repairReplicas(const std::string& key,
+                         const VersionedValue& winner,
+                         std::vector<std::string> stale_peers);
+
     /**
     * Selects a peer to gossip with. If none, log + return.
     * Cannot select self.

@@ -505,6 +505,92 @@ that this specific failure mode won't recur silently.
 *Context:* raised during `feature/hh-delivery` test-harness debugging
 session.
 
+### Q33 — Should node-to-node RPCs set deadlines, matching `client.cpp`'s newer paths?
+Raised repeatedly across Phase 5 and Phase 6 sessions: `client.cpp`'s
+`--status`/`--remove`/`--replicate-write` paths set a 2s deadline on
+their `grpc::ClientContext`s (see Q10's update), but every node-to-node
+RPC call site — `coordinatePut`'s fan-out, `ReplicateRead`'s fan-out
+inside `Get`, `deliverHints`, and now `repairReplicas` (Phase 6) — sets
+none. A peer that's unreachable in a way that doesn't fail fast
+(firewalled rather than connection-refused) can hang one of these calls
+indefinitely rather than failing in milliseconds.
+
+*Status:* unresolved, explicitly deferred by request — intended as a
+single codebase-wide pass across all four call sites at once, not a
+one-off fix scoped to whichever call site happens to be under discussion
+when it's noticed. The Phase 6 read-repair session specifically chose
+not to fix just its own new call site in isolation, for consistency with
+this plan.
+*Context:* first flagged for `client.cpp` at Q10; recurred at every
+node-to-node fan-out site added since, most recently `repairReplicas`
+during the Phase 6 read-repair design session.
+
+### Q34 — `ring.hpp`'s `preferenceList`: does `N == total node count` deserve different handling than a genuine hint-holder gap?
+Discovered while debugging `harness/test_read_repair.sh`: `preferenceList`
+increments `natural_count` for every distinct candidate it walks past,
+reachable or not — an unreachable one is deferred into `pending_hints`,
+and filling that slot from the queue requires finding a different,
+not-yet-seen, reachable candidate later in the same walk. With exactly
+`N` physical nodes in the whole cluster, once all `N` have been visited
+once, there is nobody left to promote — the function returns a list of
+size `N-1`, not a size-`N` list with a hint marker. `coordinatePut` never
+dials the missing node in this case; its own `findSubstitute`/
+`HINT_SEARCH_EXHAUSTED` fallback (which requires the node to have been a
+listed pref_list member whose live RPC then failed) never runs either.
+Both paths reach the same end state — no hint exists anywhere for the
+down node — but by genuinely different mechanisms, and this specific one
+(`N == cluster size`) was apparently never exercised by any earlier test:
+`test_hinted_handoff.sh`'s 4-node setup exists specifically so hinted
+handoff's own code never has to hit it.
+
+*Status:* unresolved — not yet decided whether this is the intended,
+accepted behavior for a cluster running at exactly `N` nodes (write still
+succeeds via `W`, the gap is real but bounded to "no substitute
+possible," and Phase 6's read-repair is the only recovery path for it —
+which is arguably fine) or worth its own explicit handling later. Ring
+math is the kind of thing the project owner verifies personally rather
+than accepting a proposed fix on Claude's say-so — flagged, not changed.
+*Context:* surfaced during `feature/rr-harness` debugging, Phase 6.
+
+### Q35 — `reachabilityLoop` reads `unreachable_peers_` without holding its mutex
+`reachabilityLoop`'s outer condition, `while
+(!unreachable_peers_.empty())`, reads the member directly rather than
+through `unreachableSnapshot()` or a lock — every other access to
+`unreachable_peers_` in this file goes through
+`unreachable_peers_mutex_`. This is a genuine data race by the language's
+rules (a mutex-guarded member read from a different thread without the
+mutex), independent of whatever else is happening around it.
+
+*Status:* unresolved, not yet observed to cause an actual symptom —
+spotted while debugging an unrelated pair of harness failures (Phase 6),
+not because it explained either of them. Likely fix is trivial
+(`unreachableSnapshot().empty()`, already exists and already used
+correctly elsewhere in the same file), just not yet applied.
+*Context:* surfaced during `feature/rr-harness` debugging session, while
+tracing through `reachabilityRound`'s exact timing for an unrelated
+reason.
+
+### Q36 — Does `repairReplicas`' per-`Get` detached thread need any bound?
+Phase 6's remote repair path spawns one new detached `std::thread` per
+`Get` that finds ≥1 remotely-stale peer — not a single persistent
+background loop the way `gossipLoop`/`reachabilityLoop` are. Both rely on
+the same accepted "detached + no stop signal is only correct as long as
+this process's only exit path is SIGKILL" assumption (Q7's neighborhood,
+`node_service.hpp`'s `start()` comment), but the persistent loops are
+one-per-process while this is potentially many-per-process, concurrently,
+under a hot stale key being read repeatedly before its repair completes.
+No test has yet exercised concurrent overlapping repairs against the
+same key, and nothing currently bounds how many such threads can exist
+at once.
+
+*Status:* unresolved, not yet known to matter — `storeReplicatedWrite`'s
+own dominance check makes concurrent repair pushes to the same peer/key
+safe regardless of ordering (worst case, a benign `ALREADY_CURRENT`), so
+this is a resource-growth question, not a correctness one, unless proven
+otherwise.
+*Context:* surfaced during the Phase 6 `feature/read-repair` design
+session, while confirming the detached-thread approach; not yet acted on.
+
 ---
 
 ## Resolved

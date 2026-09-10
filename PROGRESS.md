@@ -15,7 +15,7 @@
 | 3 | Any-node coordinator + basic quorum read/write | ✅ Done |
 | 4 | Vector clocks + conflict detection | ✅ Done |
 | 5 | Hinted handoff | ✅ Done |
-| 6 | Read-repair | ⬜ Not started |
+| 6 | Read-repair | ✅ Done |
 | 7 | Dashboard | ⬜ Not started |
 | 8 | Fault-injection harness (minimum viable) | ⬜ Not started |
 | 9 | Convergence testing + full comparison run + polish | ⬜ Not started |
@@ -2891,6 +2891,162 @@ it buys in exchange: the write succeeds at all during the window, and the
 moment the real owner is confirmed reachable again, `deliverHints` closes
 the gap without waiting for a client `Get` to trigger read-repair
 (Phase 6) or for full anti-entropy to eventually notice.
+
+## Phase 6 — Read-repair (done)
+
+Closes the specific gap Phase 5's own GTStore comparison named at the end
+of that phase: a client `Get` can now be the thing that notices and fixes
+a replica left behind, not just hinted handoff's reachability-triggered
+recovery.
+
+### Mechanism
+
+`Get`'s existing fan-out already contacts every reachable member of a
+key's preference list (not just `R` of them), and `resolveGetResult`
+already picks a winner via `computeFrontier` + `resolveLWW` (Phase 4).
+Both of those facts made this phase mostly orchestration over existing
+primitives, not new comparison logic:
+
+- **Repair set = "not `EQUAL` to the winner."** Because the winner is
+  drawn from `computeFrontier`, nothing in the collected responses can
+  *dominate* it — frontier's own definition already rules that outcome
+  out. That leaves exactly three relationships to any given response:
+  `EQUAL` (current, skip), `DOMINATED`, or `CONCURRENT` (a losing sibling
+  under this project's LWW-overwrite policy — Q24/B2 — not a
+  sibling-versions design). One condition
+  (`!found || clock != winner.clock`) covers not-found, dominated, and
+  concurrent-loser uniformly; no separate "truly dominated" list needed.
+- **Overwriting a `CONCURRENT` loser during repair is deliberate, not
+  incidental.** The winner never causally dominates a concurrent loser —
+  it only won a timestamp tiebreak. Repairing it means overwriting a
+  causally-incomparable version because this project's own resolution
+  policy said so. Sound specifically because this system committed to
+  LWW-overwrite rather than sibling versions; would be a real bug under
+  a sibling-versions design.
+- **Reuses `storeReplicatedWrite`'s existing dominance check** as the
+  repair-write itself — a repair push is a plain `ReplicateWrite` with
+  `hint_for_node_id` left unset, going through the same
+  overwrite-on-`DOMINATED`-or-`CONCURRENT` / keep-on-`EQUAL`-or-
+  `DOMINATES` policy any other replicated write already goes through,
+  including its built-in protection against a newer write landing
+  between the read and the repair push.
+- **Self-repair is synchronous, remote repair is not.** If the
+  coordinator's own local copy needs repair, `storeReplicatedWrite` runs
+  in-process before anything else, and completes before `Get` returns.
+  Remote repair runs on a detached `std::thread`
+  (`NodeServiceImpl::repairReplicas`) the client's response does not
+  wait on — chosen over blocking the client on `N-R` extra writes it
+  doesn't need for correctness, the same reasoning Dynamo/Cassandra use
+  for read-repair generally. Values are passed by value into the
+  `std::thread` constructor, not captured by reference into a lambda —
+  `Get`'s own locals (`results`, `pref_list`, etc.) go out of scope the
+  moment `Get` returns, before the detached thread has necessarily run
+  at all.
+- **Concurrent fan-out inside `repairReplicas`**, not sequential — added
+  after the first Cursor pass shipped a plain sequential loop, so one
+  slow-or-unreachable stale peer wouldn't delay repairing the others in
+  the same batch. Same `std::async` + `futures` + `.get()`-them-all idiom
+  already used elsewhere in this file; each async task owns its own
+  `req`/`resp`/`context`/`stub` rather than sharing any of `Get`'s state.
+
+### New in `logging.hpp`
+
+`READ_REPAIR_INIT` (once per `Get` that finds ≥1 stale entry, logs
+`stale_count`), `READ_REPAIR_SUCCEEDED` (per peer, `outcome=STORED` or
+`outcome=ALREADY_CURRENT` — the latter means something else already
+fixed it between the read and the repair push, still a success at the
+RPC level), `READ_REPAIR_FAILED` (per peer, `reason=transport` vs.
+`reason=refused` in the same line rather than as separate event types —
+mirrors the transport-vs-refusal distinction Phase 5 already established
+for `deliverHints`, and only `reason=transport` calls `markUnreachable`).
+
+### Known gap, not fixed here
+
+`repairReplicas`'s `grpc::ClientContext` sets no deadline — matching the
+existing lack of one on every other node-to-node RPC call site in this
+file (`ReplicateRead`'s fan-out, `coordinatePut`, `deliverHints`). Not a
+gap introduced by this phase; this phase just adds one more instance of
+it. Deliberately deferred to a dedicated, codebase-wide pass rather than
+patched here in isolation — see `OPEN_QUESTIONS.md` Q33.
+
+### Verification: `harness/test_read_repair.sh`
+
+3 nodes, `N=3` — reusing the "`N` equals total node count" determinism
+trick `test_conflict_scenario_race.sh` established, but for a different
+purpose here: forcing the case where a killed replica cannot receive a
+hint at all (no fourth node exists for `findSubstitute` to hand one to),
+so any subsequent recovery is attributable to read-repair alone, not a
+timing race against `deliverHints`. Two sub-scenarios from one setup: Get
+coordinated by a current node (exercises `repairReplicas`'s
+detached-thread path) and Get coordinated by the stale node itself
+(exercises the synchronous self-repair call). Proof in both cases is a
+direct `--replicate-read` against the repaired node, not trust in `Get`'s
+own resolved value — same ground-truth-over-trusted-output convention
+`test_conflict_scenario_race.sh` uses.
+
+**Three things the first draft of this harness got wrong, corrected
+during debugging — all mechanism-level misunderstandings, not flaky
+timing:**
+
+1. Assumed `HINT_SEARCH_EXHAUSTED` (logged inside `coordinatePut`'s own
+   `findSubstitute` fallback) would be the observable proof that no hint
+   exists for the killed node. It never fired. The actual mechanism is
+   upstream of that: `ring.hpp`'s `preferenceList` increments
+   `natural_count` for every distinct candidate it walks past, reachable
+   or not, so with exactly `N` physical nodes total, an unreachable one
+   simply drops the returned list to size `N-1` — `coordinatePut` never
+   dials it, so its own fallback logic never runs. Same end state (no
+   hint, anywhere), different code path than assumed. New:
+   `OPEN_QUESTIONS.md` Q34. Fixed by asserting the invariant (no
+   `HINT_CREATED`/`HINT_STORED` for the test keys, full stop) instead of
+   the specific log line.
+2. Assumed a plain kill-and-restart of a node would produce
+   `NODE_REBOOTED`. It structurally cannot: `mergeInto` only logs that on
+   a `REMOVED`→`UP` transition, and nothing in this scenario ever calls
+   `RemoveNode` — a crash isn't a gossip-level event, so the node's
+   gossiped status never leaves `UP`. (`verify_remove_reboot.sh`'s own
+   `NODE_REBOOTED` check only works because an explicit `RemoveNode` call
+   earlier in that same script put the node into `REMOVED` first.) Fixed
+   by waiting on `PROBE_SUCCEEDED` — `reachabilityRound`'s own local
+   recovery signal — which is what the scenario actually depends on,
+   rather than a real gossip status the scenario was never producing.
+3. `client.cpp --replicate-write --clock=...` was tried as a way to
+   inject staleness directly and skip the kill/restart cycle entirely.
+   `parseClockArg` splits a `node_id:counter` pair on the *first* colon
+   it finds, and `node_id` in this project *is* the listen address
+   (`127.0.0.1:60051`, Q7) — already containing a colon. Any `--clock=`
+   argument naming a real node_id is currently unparseable. Not fixed —
+   a `client.cpp` bug, flagged rather than patched in a harness-only
+   branch; it's the reason this harness uses a real kill/restart instead
+   of direct injection at all.
+
+Also surfaced, unrelated to either failure above: `reachabilityLoop`
+reads `unreachable_peers_.empty()` without holding
+`unreachable_peers_mutex_` — an unsynchronized read of an otherwise
+always-locked member. New: `OPEN_QUESTIONS.md` Q35.
+
+**Confirmed passing** after the three fixes above (branch
+`feature/rr-harness`, following implementation on `feature/read-repair`).
+
+### GTStore comparison, this phase specifically
+
+Phase 5's own GTStore comparison ended by naming the gap this phase
+closes: a hint-holder crash before delivery, and "the moment the real
+owner is confirmed reachable again, `deliverHints` closes the gap without
+waiting for a client `Get` to trigger read-repair (Phase 6) or for full
+anti-entropy to eventually notice." Read-repair is that remaining path,
+and this phase's own harness ended up constructing the case where it's
+the *only* path: with `N` equal to the cluster size, a killed replica
+gets no hint-holder at all (Q34), so nothing but a future `Get` can ever
+bring it current again. GTStore has no equivalent gap to compare against,
+for the reason already named in Phase 5: write-all either lands on every
+replica synchronously or the write fails outright, so there is no state
+where a replica is quietly behind for a client read to ever catch. Read-
+repair closes a hole that only exists because this project chose sloppy
+quorum + hinted handoff over write-all in the first place — the cost is
+now visible end-to-end, not just in the abstract: a client's own `Get`
+does double duty as the system's convergence mechanism, something
+GTStore's clients never need to do.
 
 ## How to update this file
 When a phase wraps: flip its status in the table, add a summary block (what
